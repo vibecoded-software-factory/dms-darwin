@@ -129,6 +129,24 @@ enum SelfTest {
             Solar.interpolate(now: date(2026, 1, 1), start: date(2026, 1, 1), stop: date(2026, 1, 1))
                 == 1.0, "degenerate interpolation is 1")
 
+        // Freedesktop channel: state shape and method routing (the directory
+        // read itself is system state; the shapes are what the shell parses).
+        let freedesktop = FreedesktopChannel()
+        let fdState = freedesktop.state()
+        let accounts = fdState["accounts"] as? [String: Any]
+        expect(accounts?["available"] as? Bool == true, "accounts backend reports available")
+        expect((accounts?["userName"] as? String)?.isEmpty == false, "userName is populated")
+        expect(
+            (fdState["settings"] as? [String: Any])?["available"] as? Bool == false,
+            "settings portal reports unavailable")
+        let unknownFd = freedesktop.handle(method: "freedesktop.bogus", params: [:])
+        expect(
+            unknownFd.result == nil && unknownFd.error == nil,
+            "unknown freedesktop method routes to nil")
+        let missingParam = freedesktop.handle(
+            method: "freedesktop.accounts.getUserIconFile", params: [:])
+        expect(missingParam.error != nil, "getUserIconFile without username errors")
+
         print("selftest: \(checks) checks, \(failed ? "FAILURES above" : "all OK")")
         return failed ? 1 : 0
     }
