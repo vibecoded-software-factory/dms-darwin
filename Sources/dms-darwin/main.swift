@@ -7,6 +7,8 @@ import Foundation
 //   dms-darwin serve      run the daemon (launchd agent's job)
 //   dms-darwin selftest   pure-logic checks
 //   dms-darwin version    print the version
+//   dms-darwin lock       engage the native lock screen
+//   dms-darwin audio-tap  system audio -> fifo, for visualizers
 
 let arguments = CommandLine.arguments
 
@@ -23,6 +25,10 @@ case "selftest":
 case "version":
     print(Server.cliVersion)
     exit(0)
+case "lock":
+    // The shell's customPowerActionLock spawns this: lock natively and let
+    // the OS own the surface and the authentication.
+    exit(NativeLock.lock() ? 0 : 1)
 case "audio-tap":
     // System-audio -> fifo, for a visualizer. Run as a child of the app
     // holding the Screen Recording grant (TCC follows the responsible
@@ -37,6 +43,6 @@ case "serve":
     }
     RunLoop.main.run()
 default:
-    print("usage: dms-darwin [serve|selftest|version]")
+    print("usage: dms-darwin [serve|selftest|version|lock|audio-tap]")
     exit(64)
 }
