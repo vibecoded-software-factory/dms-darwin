@@ -43,7 +43,9 @@ final class Server {
 
         func wants(_ service: String) -> Bool {
             guard let services = self.subscribedServices else { return false }
-            return services.isEmpty || services.contains(service)
+            // Upstream defaults an empty list to ["all"] and honors the
+            // literal "all" (DMSService.subscribeAll sends it).
+            return services.isEmpty || services.contains("all") || services.contains(service)
         }
     }
 
@@ -52,8 +54,11 @@ final class Server {
     }
 
     var capabilities: [String] {
-        var caps: [String] = []
-        if self.brightness.available { caps.append("brightness") }
+        // "plugins" is unconditional upstream (the list can never be empty -
+        // an empty list trips the shell's "empty means clipboard available"
+        // legacy branch). "brightness" announces manager-init like upstream,
+        // which serves an empty device list rather than dropping the channel.
+        var caps: [String] = ["plugins", "brightness"]
         if self.gamma.available { caps.append("gamma") }
         if self.freedesktop.available { caps.append("freedesktop") }
         return caps
@@ -197,7 +202,8 @@ final class Server {
                         "cliVersion": Self.cliVersion,
                         "capabilities": self.capabilities,
                     ]), to: connection)
-            if connection.wants("brightness"), self.brightness.available {
+            if connection.wants("brightness") {
+                // Upstream pushes initial state even with zero devices.
                 self.send(
                     Wire.event(service: "brightness", data: self.brightness.state()),
                     to: connection)
@@ -216,10 +222,15 @@ final class Server {
             self.handleBrightness(request, from: connection)
         case let method where method.hasPrefix("wayland.gamma."):
             guard self.gamma.available else {
-                self.send(Wire.error(id: request.id, "gamma control unavailable"), to: connection)
+                self.send(Wire.error(id: request.id, "wayland manager not initialized"), to: connection)
                 return
             }
-            guard let result = self.gamma.handle(method: method, params: request.params) else {
+            let outcome = self.gamma.handle(method: method, params: request.params)
+            if let failure = outcome.error {
+                self.send(Wire.error(id: request.id, failure), to: connection)
+                return
+            }
+            guard let result = outcome.result else {
                 self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
                 return
             }
@@ -249,16 +260,27 @@ final class Server {
     // subscribers.
 
     private func handleBrightness(_ request: Wire.Request, from connection: Connection) {
-        guard self.brightness.available else {
-            self.send(Wire.error(id: request.id, "no brightness devices"), to: connection)
-            return
-        }
-
         func respondState() {
             let state = self.brightness.state()
             self.send(Wire.response(id: request.id, result: state), to: connection)
             self.lastBrightnessPercent = self.brightness.currentPercent()
             self.broadcast(service: "brightness", data: state)
+        }
+
+        // Mutations follow the upstream contract: `device` is required and
+        // must name a known device, and out-of-range percents are errors,
+        // not clamps.
+        func resolveDevice() -> Bool {
+            guard let device = request.params["device"] as? String else {
+                self.send(Wire.error(id: request.id, "missing param: device"), to: connection)
+                return false
+            }
+            guard device == BrightnessService.deviceId, self.brightness.available else {
+                self.send(
+                    Wire.error(id: request.id, "device not found: \(device)"), to: connection)
+                return false
+            }
+            return true
         }
 
         switch request.method {
@@ -270,15 +292,22 @@ final class Server {
                 self.send(Wire.error(id: request.id, "missing param: percent"), to: connection)
                 return
             }
+            guard percent >= 0 && percent <= 100 else {
+                self.send(
+                    Wire.error(id: request.id, "percent out of range: \(percent)"), to: connection)
+                return
+            }
+            guard resolveDevice() else { return }
             let exponential = request.params["exponential"] as? Bool ?? false
             let exponent = request.params["exponent"] as? Double ?? 1.2
             guard self.brightness.set(percent: percent, exponential: exponential, exponent: exponent)
             else {
-                self.send(Wire.error(id: request.id, "set failed"), to: connection)
+                self.send(Wire.error(id: request.id, "failed to set brightness"), to: connection)
                 return
             }
             respondState()
         case "brightness.increment", "brightness.decrement":
+            guard resolveDevice() else { return }
             let step = request.params["step"] as? Int ?? 10
             let signed = request.method.hasSuffix("increment") ? step : -step
             let current = self.brightness.currentPercent() ?? 0
@@ -287,7 +316,7 @@ final class Server {
             let exponent = request.params["exponent"] as? Double ?? 1.2
             guard self.brightness.set(percent: target, exponential: exponential, exponent: exponent)
             else {
-                self.send(Wire.error(id: request.id, "set failed"), to: connection)
+                self.send(Wire.error(id: request.id, "failed to set brightness"), to: connection)
                 return
             }
             respondState()
