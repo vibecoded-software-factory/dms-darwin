@@ -90,7 +90,12 @@ final class Server {
         // brightness). 2s is imperceptible for a slider and costs nothing.
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 2, repeating: 2)
-        timer.setEventHandler { [weak self] in self?.pollBrightness() }
+        timer.setEventHandler { [weak self] in
+            self?.pollBrightness()
+            // Appearance safety net: App Nap can withhold the theme-change
+            // notification from an idle agent; the poll catches it anyway.
+            self?.freedesktop.pollAppearance()
+        }
         timer.resume()
         self.pollTimer = timer
 
@@ -155,7 +160,12 @@ final class Server {
         }
         // Best-effort: a client too slow to take an event gets dropped, the
         // same policy as the compositor's event stream.
-        if sent < 0 && errno != EAGAIN { self.dropConnection(connection) }
+        if sent < 0 && errno != EAGAIN {
+            print("[server] DROP fd=\(connection.fd) errno=\(errno)")
+            self.dropConnection(connection)
+        } else if sent >= 0 && sent < data.count {
+            print("[server] SHORT WRITE fd=\(connection.fd) sent=\(sent)/\(data.count)")
+        }
     }
 
     private func broadcast(service: String, data: Any) {
@@ -174,6 +184,9 @@ final class Server {
         switch request.method {
         case "subscribe":
             connection.subscribedServices = request.params["services"] as? [String] ?? []
+            print(
+                "[server] subscribe fd=\(connection.fd) services=\(connection.subscribedServices ?? [])"
+            )
             // Handshake first - the shell gates every feature on it - then
             // the current state of everything subscribed.
             self.send(

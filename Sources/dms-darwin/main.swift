@@ -36,6 +36,16 @@ case "audio-tap":
     let fifo = arguments.count > 2 ? arguments[2] : "/tmp/dms-audio-tap.fifo"
     exit(AudioTap(fifoPath: fifo).run())
 case "serve":
+    // launchd points stdout at a log file; line-buffer it so prints land live.
+    setvbuf(stdout, nil, _IOLBF, 0)
+    // Opt out of App Nap: a napped agent stops receiving distributed
+    // notifications (regardless of suspension behavior), which silently
+    // breaks appearance-change delivery. The daemon is tiny; keeping it
+    // schedulable costs nothing and also keeps the gamma tick on time.
+    let activity = ProcessInfo.processInfo.beginActivity(
+        options: [.userInitiatedAllowingIdleSystemSleep],
+        reason: "event delivery must survive idle (App Nap drops notifications)")
+    _ = activity
     let server = Server(socketPath: defaultSocketPath())
     guard server.start() else {
         print("[server] failed to bind \(defaultSocketPath())")
