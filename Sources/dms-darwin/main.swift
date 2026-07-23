@@ -23,6 +23,12 @@ case "selftest":
 case "version":
     print(Server.cliVersion)
     exit(0)
+case "audio-tap":
+    // System-audio -> fifo, for a visualizer. Run as a child of the app
+    // holding the Screen Recording grant (TCC follows the responsible
+    // process).
+    let fifo = arguments.count > 2 ? arguments[2] : "/tmp/dms-audio-tap.fifo"
+    exit(AudioTap(fifoPath: fifo).run())
 case "serve":
     let server = Server(socketPath: defaultSocketPath())
     guard server.start() else {
