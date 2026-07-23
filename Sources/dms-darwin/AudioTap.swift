@@ -91,7 +91,7 @@ final class AudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
         pcm.withUnsafeBytes { raw in
             // Non-blocking best-effort: with no reader (or a slow one) the
             // samples drop - a visualizer wants NOW, never a backlog.
-            _ = write(self.fifoFd, raw.baseAddress, raw.count)
+            _ = Darwin.write(self.fifoFd, raw.baseAddress, raw.count)
         }
     }
 
