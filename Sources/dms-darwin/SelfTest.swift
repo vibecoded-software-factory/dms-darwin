@@ -136,9 +136,16 @@ enum SelfTest {
         let accounts = fdState["accounts"] as? [String: Any]
         expect(accounts?["available"] as? Bool == true, "accounts backend reports available")
         expect((accounts?["userName"] as? String)?.isEmpty == false, "userName is populated")
+        let fdSettings = fdState["settings"] as? [String: Any]
+        expect(fdSettings?["available"] as? Bool == true, "settings portal reports available")
         expect(
-            (fdState["settings"] as? [String: Any])?["available"] as? Bool == false,
-            "settings portal reports unavailable")
+            [1, 2].contains(fdSettings?["colorScheme"] as? Int ?? 0),
+            "colorScheme is a portal value (1 dark / 2 light)")
+        let schemeReply = freedesktop.handle(
+            method: "freedesktop.settings.getColorScheme", params: [:])
+        expect(
+            (schemeReply.result as? [String: Any])?["colorScheme"] != nil,
+            "getColorScheme answers a colorScheme")
         let unknownFd = freedesktop.handle(method: "freedesktop.bogus", params: [:])
         expect(
             unknownFd.result == nil && unknownFd.error == nil,

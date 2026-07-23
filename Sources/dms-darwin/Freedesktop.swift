@@ -4,16 +4,43 @@ import OpenDirectory
 // The `freedesktop.*` channel: the shell's accounts/portal protocol, shapes
 // mirrored from the upstream Go daemon's freedesktop service. On macOS the
 // accounts backend is OpenDirectory - the user's avatar lives in the local
-// directory node as JPEGPhoto, readable without privileges.
+// directory node as JPEGPhoto, readable without privileges - and the
+// settings portal's color scheme is the system appearance: reads map
+// AppleInterfaceStyle to the portal values (1 = prefer-dark, 2 =
+// prefer-light) and the AppleInterfaceThemeChanged distributed notification
+// becomes a state broadcast, so the shell follows macOS light/dark switches
+// the way it follows the portal on Linux. (Writes go the other way: the
+// shell execs `gsettings`, provided on macOS by the install glue's shim.)
 //
-// The settings portal (color scheme, icon theme) and the screensaver report
-// unavailable: macOS appearance sync is a separate arc, and idle inhibition
-// already goes through the wayland IdleInhibitor path.
+// The screensaver reports unavailable: idle inhibition already goes through
+// the wayland IdleInhibitor path.
 final class FreedesktopChannel {
     private let cacheDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".cache/dms-darwin", isDirectory: true)
 
+    // The server hooks this to push fresh state when the system appearance
+    // changes behind our back (the OS auto-switch, System Settings).
+    var onStateChanged: (() -> Void)?
+
     var available: Bool { true }
+
+    init() {
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil, queue: .main
+        ) { [weak self] _ in self?.onStateChanged?() }
+    }
+
+    // Portal color-scheme values: 1 = prefer-dark, 2 = prefer-light. The
+    // synchronize matters: a long-running daemon's preferences cache goes
+    // stale, and this read happens right after the change notification.
+    private func colorScheme() -> Int {
+        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
+        let style =
+            CFPreferencesCopyAppValue(
+                "AppleInterfaceStyle" as CFString, kCFPreferencesAnyApplication) as? String
+        return style == "Dark" ? 1 : 2
+    }
 
     // ---- OpenDirectory access ----
 
@@ -74,7 +101,7 @@ final class FreedesktopChannel {
                 "passwordMode": 0,
                 "uid": UInt64(getuid()),
             ],
-            "settings": ["available": false, "colorScheme": 0],
+            "settings": ["available": true, "colorScheme": self.colorScheme()],
             "screensaver": [
                 "available": false, "active": false, "inhibited": false, "inhibitors": [],
             ],
@@ -131,8 +158,10 @@ final class FreedesktopChannel {
         case "freedesktop.accounts.setEmail", "freedesktop.accounts.setLanguage",
             "freedesktop.accounts.setLocation":
             return (nil, "not supported on darwin")
-        case "freedesktop.settings.getColorScheme", "freedesktop.settings.setIconTheme":
-            return (nil, "settings portal unavailable")
+        case "freedesktop.settings.getColorScheme":
+            return (["colorScheme": self.colorScheme()], nil)
+        case "freedesktop.settings.setIconTheme":
+            return (nil, "not supported on darwin")
         default:
             return (nil, nil)
         }

@@ -101,6 +101,13 @@ final class Server {
             self.broadcast(service: "gamma", data: self.gamma.state())
         }
 
+        // The system appearance changes behind our back (OS auto-switch,
+        // System Settings); the shell follows these broadcasts.
+        self.freedesktop.onStateChanged = { [weak self] in
+            guard let self else { return }
+            self.broadcast(service: "freedesktop", data: self.freedesktop.state())
+        }
+
         print("[server] listening on \(self.socketPath) capabilities=\(self.capabilities)")
         return true
     }
