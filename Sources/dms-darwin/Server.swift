@@ -12,7 +12,7 @@ final class Server {
     // v6: the shell gates the gamma (night mode) channel on >= 6. Every
     // higher version gate in the shell is ALSO gated on a capability this
     // daemon does not announce, so 6 promises exactly what we serve.
-    static let apiVersion = 6
+    static let apiVersion = 9
     static let cliVersion = "dms-darwin 0.1.0"
 
     private let socketPath: String
@@ -23,6 +23,10 @@ final class Server {
     private let brightness = BrightnessService()
     private let gamma = GammaChannel()
     private let freedesktop = FreedesktopChannel()
+    private let bluetooth = BluetoothChannel()
+    private let plugins = PluginsChannel()
+    // Registry/git work can take seconds; it never runs on the main loop.
+    private let pluginsQueue = DispatchQueue(label: "dev.dms.plugins")
     // Last state pushed to subscribers, for the poll-driven change detection
     // (the hardware brightness keys change the panel outside our socket).
     private var lastBrightnessPercent: Int?
@@ -61,6 +65,7 @@ final class Server {
         var caps: [String] = ["plugins", "brightness"]
         if self.gamma.available { caps.append("gamma") }
         if self.freedesktop.available { caps.append("freedesktop") }
+        if self.bluetooth.available { caps.append("bluetooth") }
         return caps
     }
 
@@ -118,6 +123,17 @@ final class Server {
             self.broadcast(service: "freedesktop", data: self.freedesktop.state())
         }
 
+        // Pairing prompts drive the shell's BluetoothPairingModal; state
+        // changes keep its device views fresh.
+        self.bluetooth.onPairingPrompt = { [weak self] prompt in
+            guard let self else { return }
+            self.broadcast(service: "bluetooth.pairing", data: prompt)
+        }
+        self.bluetooth.onStateChanged = { [weak self] in
+            guard let self else { return }
+            self.broadcast(service: "bluetooth", data: self.bluetooth.state())
+        }
+
         print("[server] listening on \(self.socketPath) capabilities=\(self.capabilities)")
         return true
     }
@@ -146,7 +162,7 @@ final class Server {
 
     private func readFrom(_ connection: Connection) {
         var scratch = [UInt8](repeating: 0, count: 65536)
-        let count = read(connection.fd, &scratch, scratch.count)
+        let count = Darwin.read(connection.fd, &scratch, scratch.count)
         if count <= 0 {
             self.dropConnection(connection)
             return
@@ -161,7 +177,7 @@ final class Server {
 
     private func send(_ data: Data, to connection: Connection) {
         let sent = data.withUnsafeBytes { raw in
-            write(connection.fd, raw.baseAddress, raw.count)
+            Darwin.write(connection.fd, raw.baseAddress, raw.count)
         }
         // Best-effort: a client too slow to take an event gets dropped, the
         // same policy as the compositor's event stream.
@@ -238,6 +254,36 @@ final class Server {
             // Mutations answer SuccessResult, reads answer the state; either
             // way push fresh state to subscribers (idempotent for reads).
             self.broadcast(service: "gamma", data: self.gamma.state())
+        case let method where method.hasPrefix("bluetooth."):
+            guard self.bluetooth.available else {
+                self.send(Wire.error(id: request.id, "bluetooth manager not initialized"), to: connection)
+                return
+            }
+            let outcome = self.bluetooth.handle(method: method, params: request.params)
+            if let failure = outcome.error {
+                self.send(Wire.error(id: request.id, failure), to: connection)
+            } else if let result = outcome.result {
+                self.send(Wire.response(id: request.id, result: result), to: connection)
+            } else {
+                self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
+            }
+        case let method where method.hasPrefix("plugins."):
+            let requestCopy = request
+            self.pluginsQueue.async { [weak self] in
+                guard let self else { return }
+                let outcome = self.plugins.handle(method: method, params: requestCopy.params)
+                DispatchQueue.main.async {
+                    if let failure = outcome.error {
+                        self.send(Wire.error(id: requestCopy.id, failure), to: connection)
+                    } else if let result = outcome.result {
+                        self.send(Wire.response(id: requestCopy.id, result: result), to: connection)
+                    } else {
+                        self.send(
+                            Wire.error(id: requestCopy.id, "unknown method: \(method)"),
+                            to: connection)
+                    }
+                }
+            }
         case let method where method.hasPrefix("freedesktop."):
             let outcome = self.freedesktop.handle(method: method, params: request.params)
             if let failure = outcome.error {
