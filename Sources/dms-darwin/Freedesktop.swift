@@ -14,7 +14,7 @@ import OpenDirectory
 //
 // The screensaver reports unavailable: idle inhibition already goes through
 // the wayland IdleInhibitor path.
-final class FreedesktopChannel {
+final class FreedesktopChannel: NSObject {
     private let cacheDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".cache/dms-darwin", isDirectory: true)
 
@@ -24,11 +24,35 @@ final class FreedesktopChannel {
 
     var available: Bool { true }
 
-    init() {
+    override init() {
+        super.init()
+        // deliverImmediately matters: an idle agent gets App Napped, and
+        // with the default suspension behavior the theme-change notification
+        // is silently dropped while napping - the sync then only works when
+        // the daemon happens to be warm (fresh install, recent requests).
         DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
-            object: nil, queue: .main
-        ) { [weak self] _ in self?.onStateChanged?() }
+            self, selector: #selector(self.appearanceChanged),
+            name: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil, suspensionBehavior: .deliverImmediately)
+    }
+
+    @objc private func appearanceChanged(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in self?.noteAppearance() }
+    }
+
+    // Belt and braces: the server's poll timer also calls this, so even if
+    // the OS withholds the notification the change lands within a tick.
+    private var lastScheme: Int?
+
+    func pollAppearance() {
+        self.noteAppearance()
+    }
+
+    private func noteAppearance() {
+        let scheme = self.colorScheme()
+        guard scheme != self.lastScheme else { return }
+        self.lastScheme = scheme
+        self.onStateChanged?()
     }
 
     // Portal color-scheme values: 1 = prefer-dark, 2 = prefer-light. The
