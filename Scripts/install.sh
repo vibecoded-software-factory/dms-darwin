@@ -14,6 +14,17 @@ swift build -c release
 mkdir -p "$BIN_DIR"
 install -m 755 .build/release/dms-darwin "$BIN_DIR/dms-darwin"
 
+# A stable code-signing identity keeps the Bluetooth TCC grant alive across
+# rebuilds; an ad-hoc signature re-pins to the per-build hash and macOS
+# re-prompts every install (the same reason bento ships as a signed bundle).
+# Reuse bento's self-signed "bento codesign" cert if present.
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "bento codesign"; then
+	security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+		-k "" "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
+	codesign --force --sign "bento codesign" --identifier dev.dms.darwin \
+		"$BIN_DIR/dms-darwin" 2>/dev/null || true
+fi
+
 mkdir -p "$(dirname "$PLIST")"
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
