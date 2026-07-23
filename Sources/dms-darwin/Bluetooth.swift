@@ -187,18 +187,19 @@ final class BluetoothChannel: NSObject {
     ) -> (result: Any?, error: String?) {
         switch method {
         case "bluetooth.connect":
-            let status = device.openConnection()
-            guard status == kIOReturnSuccess else {
-                return (nil, "failed to connect: IOReturn \(status)")
+            // openConnection blocks (upstream's Connect is async over DBus);
+            // run it off the main loop so the daemon never freezes, and
+            // broadcast the settled state when it returns.
+            DispatchQueue.global(qos: .userInitiated).async {
+                device.openConnection()
+                DispatchQueue.main.async { self.onStateChanged?() }
             }
-            self.onStateChanged?()
             return (["success": true, "message": "connecting"], nil)
         case "bluetooth.disconnect":
-            let status = device.closeConnection()
-            guard status == kIOReturnSuccess else {
-                return (nil, "failed to disconnect: IOReturn \(status)")
+            DispatchQueue.global(qos: .userInitiated).async {
+                device.closeConnection()
+                DispatchQueue.main.async { self.onStateChanged?() }
             }
-            self.onStateChanged?()
             return (["success": true, "message": "disconnected"], nil)
         case "bluetooth.pair":
             guard let pair = IOBluetoothDevicePair(device: device) else {
