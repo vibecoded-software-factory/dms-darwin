@@ -92,6 +92,13 @@ final class Server {
         timer.resume()
         self.pollTimer = timer
 
+        // The gamma schedule moves the temperature on its own (dawn/dusk
+        // ticks, a geolocation arriving); push the fresh state when it does.
+        self.gamma.onStateChanged = { [weak self] in
+            guard let self else { return }
+            self.broadcast(service: "gamma", data: self.gamma.state())
+        }
+
         print("[server] listening on \(self.socketPath) capabilities=\(self.capabilities)")
         return true
     }
