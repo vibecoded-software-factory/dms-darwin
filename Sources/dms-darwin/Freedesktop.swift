@@ -1,0 +1,140 @@
+import Foundation
+import OpenDirectory
+
+// The `freedesktop.*` channel: the shell's accounts/portal protocol, shapes
+// mirrored from the upstream Go daemon's freedesktop service. On macOS the
+// accounts backend is OpenDirectory - the user's avatar lives in the local
+// directory node as JPEGPhoto, readable without privileges.
+//
+// The settings portal (color scheme, icon theme) and the screensaver report
+// unavailable: macOS appearance sync is a separate arc, and idle inhibition
+// already goes through the wayland IdleInhibitor path.
+final class FreedesktopChannel {
+    private let cacheDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".cache/dms-darwin", isDirectory: true)
+
+    var available: Bool { true }
+
+    // ---- OpenDirectory access ----
+
+    private func userRecord(_ username: String) throws -> ODRecord {
+        let node = try ODNode(session: ODSession.default(), type: ODNodeType(kODNodeTypeLocalNodes))
+        return try node.record(
+            withRecordType: kODRecordTypeUsers, name: username,
+            attributes: [
+                kODAttributeTypeJPEGPhoto, kODAttributeTypePicture, kODAttributeTypeFullName,
+            ])
+    }
+
+    private func attribute(_ record: ODRecord, _ name: String) -> Any? {
+        (try? record.values(forAttribute: name))?.first
+    }
+
+    // The avatar: prefer the JPEGPhoto blob (what System Settings sets),
+    // materialized into the cache so the shell gets a plain file path; fall
+    // back to the legacy Picture path attribute.
+    private func iconFile(for username: String) -> String {
+        guard let record = try? self.userRecord(username) else { return "" }
+
+        if let photo = self.attribute(record, kODAttributeTypeJPEGPhoto) as? Data, !photo.isEmpty {
+            let cached = self.cacheDir.appendingPathComponent("avatar-\(username).jpg")
+            try? FileManager.default.createDirectory(
+                at: self.cacheDir, withIntermediateDirectories: true)
+            if (try? photo.write(to: cached)) != nil {
+                return cached.path
+            }
+        }
+        if let picture = self.attribute(record, kODAttributeTypePicture) as? String,
+            FileManager.default.fileExists(atPath: picture)
+        {
+            return picture
+        }
+        return ""
+    }
+
+    // ---- state ----
+
+    func state() -> [String: Any] {
+        let username = NSUserName()
+        let passwd = getpwnam(username)
+        return [
+            "accounts": [
+                "available": true,
+                "userPath": "/Local/Default/Users/\(username)",
+                "iconFile": self.iconFile(for: username),
+                "realName": NSFullUserName(),
+                "userName": username,
+                "accountType": 0,
+                "homeDirectory": FileManager.default.homeDirectoryForCurrentUser.path,
+                "shell": passwd.map { String(cString: $0.pointee.pw_shell) } ?? "",
+                "email": "",
+                "language": Locale.preferredLanguages.first ?? "",
+                "location": "",
+                "locked": false,
+                "passwordMode": 0,
+                "uid": UInt64(getuid()),
+            ],
+            "settings": ["available": false, "colorScheme": 0],
+            "screensaver": [
+                "available": false, "active": false, "inhibited": false, "inhibitors": [],
+            ],
+        ]
+    }
+
+    // ---- methods ----
+
+    private func setAttribute(_ name: String, to value: Any) -> String? {
+        do {
+            let record = try self.userRecord(NSUserName())
+            try record.setValue(value, forAttribute: name)
+            return nil
+        } catch {
+            // Expected on stock macOS: writing the directory record needs
+            // admin rights the agent does not hold. The wording matters -
+            // the shell pattern-matches "permission" for its toast.
+            return "permission denied by directory services: \(error.localizedDescription)"
+        }
+    }
+
+    // Returns the response payload, nil for "unknown method", or a thrown
+    // error string via the `errorOut` shape below. Mutations answer
+    // {success, message} like upstream's SuccessResult.
+    func handle(method: String, params: [String: Any]) -> (result: Any?, error: String?) {
+        switch method {
+        case "freedesktop.getState":
+            return (self.state(), nil)
+        case "freedesktop.accounts.getUserIconFile":
+            guard let username = params["username"] as? String else {
+                return (nil, "missing param: username")
+            }
+            return (["success": true, "value": self.iconFile(for: username)], nil)
+        case "freedesktop.accounts.setIconFile":
+            guard let path = params["path"] as? String else {
+                return (nil, "missing param: path")
+            }
+            guard path.isEmpty || FileManager.default.fileExists(atPath: path) else {
+                return (nil, "icon file does not exist: \(path)")
+            }
+            let data = path.isEmpty ? Data() : ((try? Data(contentsOf: URL(fileURLWithPath: path))) ?? Data())
+            if let failure = self.setAttribute(kODAttributeTypeJPEGPhoto, to: data) {
+                return (nil, failure)
+            }
+            return (["success": true, "message": "icon file set"], nil)
+        case "freedesktop.accounts.setRealName":
+            guard let name = params["name"] as? String else {
+                return (nil, "missing param: name")
+            }
+            if let failure = self.setAttribute(kODAttributeTypeFullName, to: name) {
+                return (nil, failure)
+            }
+            return (["success": true, "message": "real name set"], nil)
+        case "freedesktop.accounts.setEmail", "freedesktop.accounts.setLanguage",
+            "freedesktop.accounts.setLocation":
+            return (nil, "not supported on darwin")
+        case "freedesktop.settings.getColorScheme", "freedesktop.settings.setIconTheme":
+            return (nil, "settings portal unavailable")
+        default:
+            return (nil, nil)
+        }
+    }
+}

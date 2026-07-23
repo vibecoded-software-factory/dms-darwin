@@ -22,6 +22,7 @@ final class Server {
 
     private let brightness = BrightnessService()
     private let gamma = GammaChannel()
+    private let freedesktop = FreedesktopChannel()
     // Last state pushed to subscribers, for the poll-driven change detection
     // (the hardware brightness keys change the panel outside our socket).
     private var lastBrightnessPercent: Int?
@@ -54,6 +55,7 @@ final class Server {
         var caps: [String] = []
         if self.brightness.available { caps.append("brightness") }
         if self.gamma.available { caps.append("gamma") }
+        if self.freedesktop.available { caps.append("freedesktop") }
         return caps
     }
 
@@ -183,6 +185,11 @@ final class Server {
             if connection.wants("gamma"), self.gamma.available {
                 self.send(Wire.event(service: "gamma", data: self.gamma.state()), to: connection)
             }
+            if connection.wants("freedesktop"), self.freedesktop.available {
+                self.send(
+                    Wire.event(service: "freedesktop", data: self.freedesktop.state()),
+                    to: connection)
+            }
         case "ping":
             self.send(Wire.response(id: request.id, result: "pong"), to: connection)
         case let method where method.hasPrefix("brightness."):
@@ -200,6 +207,15 @@ final class Server {
             // Mutations answer SuccessResult, reads answer the state; either
             // way push fresh state to subscribers (idempotent for reads).
             self.broadcast(service: "gamma", data: self.gamma.state())
+        case let method where method.hasPrefix("freedesktop."):
+            let outcome = self.freedesktop.handle(method: method, params: request.params)
+            if let failure = outcome.error {
+                self.send(Wire.error(id: request.id, failure), to: connection)
+            } else if let result = outcome.result {
+                self.send(Wire.response(id: request.id, result: result), to: connection)
+            } else {
+                self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
+            }
         default:
             self.send(
                 Wire.error(id: request.id, "unknown method: \(request.method)"), to: connection)
