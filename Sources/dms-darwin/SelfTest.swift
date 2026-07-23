@@ -120,6 +120,20 @@ enum SelfTest {
         expect(Solar.position(now: date(2026, 7, 22, 19, 30), times: manual) == 0.5, "mid-dusk is 0.5")
         expect(Solar.position(now: date(2026, 7, 22, 21), times: manual) == 0.0, "after night is 0")
 
+        // Midnight-crossing schedule (upstream's activeCycle): at 00:30 with
+        // sunset 01:00, early morning belongs to yesterday's cycle - still day.
+        let crossing = Solar.manualTimes(
+            sunrise: (7, 0), sunset: (1, 0), now: date(2026, 7, 23, 0, 30), calendar: utc)
+        expect(
+            Solar.position(now: date(2026, 7, 23, 0, 30), times: crossing) == 1.0,
+            "midnight-crossing 00:30 is still day")
+        expect(
+            Solar.isDay(now: date(2026, 7, 23, 0, 30), times: crossing),
+            "isDay honors the active cycle")
+        expect(
+            !Solar.isDay(now: date(2026, 7, 22, 3, 0), times: manual),
+            "pre-dawn is not day")
+
         // Temperature interpolation, upstream's low + (high-low)*pos.
         expect(Solar.temperature(position: 0.0, low: 4000, high: 6500) == 4000, "night temp is low")
         expect(Solar.temperature(position: 1.0, low: 4000, high: 6500) == 6500, "day temp is high")

@@ -8,7 +8,8 @@ import Foundation
 //   manual sunrise/sunset  -> fixed schedule (1h twilight flanks)
 //   location (explicit or IP-geolocated via ip-api.com, same provider)
 //                          -> solar schedule (suncalc port, Solar.swift)
-//   neither                -> static: enabled means the low temperature, flat
+//   neither                -> static: position 1.0 / HighTemp (the shell's
+//                             manual toggle sets low == high)
 // The temperature follows the sun position continuously (gradual dawn/dusk
 // transitions, same interpolation as upstream). A one-minute idempotent tick
 // evaluates "what should the panel be right now" - simpler than deadline
@@ -29,8 +30,9 @@ final class GammaChannel {
     private var manualSunsetRaw: String?
     private var gammaValue = 1.0
 
-    // IP-geolocated coordinates, separate from explicit ones so an explicit
-    // setLocation always wins.
+    // IP-geolocated coordinates, kept apart from explicit ones; enabling IP
+    // lookup wipes the explicit pair (upstream semantics), so only one pair
+    // is ever populated.
     private var ipLatitude: Double?
     private var ipLongitude: Double?
     private var ipFetchInFlight = false
@@ -75,9 +77,10 @@ final class GammaChannel {
 
     private func currentPositionAndTemp(now: Date) -> (position: Double, temp: Int) {
         guard let times = self.currentSchedule(now: now) else {
-            // Static: enabled is simply "the night temperature", upstream's
-            // StateStatic - the shell's manual toggle path.
-            return (0.0, Int(self.lowTemp))
+            // No schedule: upstream reports position 1.0 and HighTemp
+            // regardless of Enabled (the shell's manual toggle sets
+            // low == high, so the applied value is the requested one).
+            return (1.0, Int(self.highTemp))
         }
         let position = Solar.position(now: now, times: times)
         return (position, Solar.temperature(position: position, low: self.lowTemp, high: self.highTemp))
@@ -146,13 +149,14 @@ final class GammaChannel {
     func state() -> [String: Any] {
         let now = Date()
         let times = self.currentSchedule(now: now)
-        let (scheduledPosition, scheduledTemp) = self.currentPositionAndTemp(now: now)
-        // Without a schedule the "sun" is simply the toggle: day unless night
-        // mode is on (v1 static semantics, what the shell's toggle expects).
-        let position = times == nil ? (self.enabled ? 0.0 : 1.0) : scheduledPosition
-        let nextTransition: Date? = times.flatMap { t in
-            [t.dawn, t.sunrise, t.sunset, t.night].first { $0 > now }
-        }
+        let (position, scheduledTemp) = self.currentPositionAndTemp(now: now)
+        let isDay = times.map { Solar.isDay(now: now, times: $0) } ?? true
+        // Upstream: next of the schedule's boundaries, or tomorrow when
+        // there is no schedule.
+        let nextTransition: Date? =
+            times.flatMap { t in
+                [t.dawn, t.sunrise, t.sunset, t.night].first { $0 > now }
+            } ?? Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: now))
         return [
             "config": [
                 "Outputs": [],
@@ -167,7 +171,7 @@ final class GammaChannel {
                 "Enabled": self.enabled,
             ],
             "currentTemp": self.enabled ? scheduledTemp : Int(GammaMath.neutralTemp),
-            "isDay": position >= 1.0,
+            "isDay": isDay,
             "sunriseTime": Self.timeString(times?.sunrise),
             "sunsetTime": Self.timeString(times?.sunset),
             "dawnTime": Self.timeString(times?.dawn),
@@ -188,32 +192,53 @@ final class GammaChannel {
         return (raw, (hour, minute))
     }
 
-    // Returns the response payload, or nil for "unknown method". Mutations
+    // Returns (result, error); both nil means "unknown method". Mutations
     // answer {success, message} like upstream's SuccessResult.
-    func handle(method: String, params: [String: Any]) -> Any? {
+    func handle(method: String, params: [String: Any]) -> (result: Any?, error: String?) {
         switch method {
         case "wayland.gamma.getState":
-            return self.state()
+            return (self.state(), nil)
         case "wayland.gamma.setEnabled":
             self.enabled = params["enabled"] as? Bool ?? false
             self.fetchIPLocationIfNeeded()
             self.evaluate(broadcast: false)
-            return ["success": true, "message": ""]
+            return (["success": true, "message": "enabled state set"], nil)
         case "wayland.gamma.setTemperature":
+            let low: Double
+            let high: Double
             if let temp = Self.number(params["temp"]) {
-                self.lowTemp = temp
-                self.highTemp = temp
+                low = temp
+                high = temp
+            } else if let lowParam = Self.number(params["low"]),
+                let highParam = Self.number(params["high"])
+            {
+                low = lowParam
+                high = highParam
             } else {
-                if let low = Self.number(params["low"]) { self.lowTemp = low }
-                if let high = Self.number(params["high"]) { self.highTemp = high }
+                return (nil, "missing temperature parameters (provide 'temp' or both 'low' and 'high')")
             }
+            guard low >= 1000 && low <= 10000 && high >= 1000 && high <= 10000 else {
+                return (nil, "temperature must be between 1000 and 10000")
+            }
+            guard low <= high else {
+                return (nil, "low temperature must not exceed high temperature")
+            }
+            self.lowTemp = low
+            self.highTemp = high
             self.evaluate(broadcast: false)
-            return ["success": true, "message": ""]
+            return (["success": true, "message": "temperature set"], nil)
         case "wayland.gamma.setLocation":
-            self.latitude = Self.number(params["latitude"])
-            self.longitude = Self.number(params["longitude"])
+            guard let latitude = Self.number(params["latitude"]),
+                let longitude = Self.number(params["longitude"])
+            else {
+                return (nil, "missing param: latitude/longitude")
+            }
+            self.latitude = latitude
+            self.longitude = longitude
+            // Upstream: an explicit location turns IP-based lookup off.
+            self.useIPLocation = false
             self.evaluate(broadcast: false)
-            return ["success": true, "message": ""]
+            return (["success": true, "message": "location set"], nil)
         case "wayland.gamma.setManualTimes":
             if let sunrise = Self.parseClock(params["sunrise"]),
                 let sunset = Self.parseClock(params["sunset"])
@@ -222,24 +247,34 @@ final class GammaChannel {
                 self.manualSunset = sunset.time
                 self.manualSunriseRaw = sunrise.raw
                 self.manualSunsetRaw = sunset.raw
-            } else {
-                self.manualSunrise = nil
-                self.manualSunset = nil
-                self.manualSunriseRaw = nil
-                self.manualSunsetRaw = nil
+                self.evaluate(broadcast: false)
+                return (["success": true, "message": "manual times set"], nil)
             }
+            self.manualSunrise = nil
+            self.manualSunset = nil
+            self.manualSunriseRaw = nil
+            self.manualSunsetRaw = nil
             self.evaluate(broadcast: false)
-            return ["success": true, "message": ""]
+            return (["success": true, "message": "manual times cleared"], nil)
         case "wayland.gamma.setUseIPLocation":
             self.useIPLocation = params["use"] as? Bool ?? false
+            if self.useIPLocation {
+                // Upstream: enabling IP lookup wipes the explicit location
+                // and flushes the cached fix, so the IP result actually
+                // drives the schedule (stale fixed coords must not win).
+                self.latitude = nil
+                self.longitude = nil
+                self.ipLatitude = nil
+                self.ipLongitude = nil
+            }
             self.fetchIPLocationIfNeeded()
             self.evaluate(broadcast: false)
-            return ["success": true, "message": ""]
+            return (["success": true, "message": "IP location preference set"], nil)
         case "wayland.gamma.setGamma":
             if let gamma = Self.number(params["gamma"]) { self.gammaValue = gamma }
-            return ["success": true, "message": ""]
+            return (["success": true, "message": "gamma set"], nil)
         default:
-            return nil
+            return (nil, nil)
         }
     }
 

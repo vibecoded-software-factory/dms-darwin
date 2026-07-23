@@ -134,16 +134,34 @@ enum Solar {
             night: sunsetDate.addingTimeInterval(transition))
     }
 
+    // Upstream's activeCycle: early-morning hours belong to yesterday's
+    // cycle when the schedule crosses midnight (e.g. manual sunset 01:00).
+    static func activeCycle(now: Date, times: SunTimes) -> SunTimes {
+        guard now < times.night.addingTimeInterval(-24 * 3600) else { return times }
+        return SunTimes(
+            dawn: times.dawn.addingTimeInterval(-24 * 3600),
+            sunrise: times.sunrise.addingTimeInterval(-24 * 3600),
+            sunset: times.sunset.addingTimeInterval(-24 * 3600),
+            night: times.night.addingTimeInterval(-24 * 3600))
+    }
+
     // Sun position 0..1, upstream's getSunPositionNormal: 0 through the
     // night, a linear ramp dawn->sunrise, 1 through the day, and a linear
     // ramp back sunset->night. The temperature follows this directly, which
     // is what makes the transitions gradual.
-    static func position(now: Date, times: SunTimes) -> Double {
+    static func position(now: Date, times schedule: SunTimes) -> Double {
+        let times = activeCycle(now: now, times: schedule)
         if now < times.dawn { return 0.0 }
         if now < times.sunrise { return interpolate(now: now, start: times.dawn, stop: times.sunrise) }
         if now < times.sunset { return 1.0 }
         if now < times.night { return interpolate(now: now, start: times.night, stop: times.sunset) }
         return 0.0
+    }
+
+    // Upstream's isDay: inside the active cycle's sunrise..sunset window.
+    static func isDay(now: Date, times schedule: SunTimes) -> Bool {
+        let times = activeCycle(now: now, times: schedule)
+        return now > times.sunrise && now < times.sunset
     }
 
     static func interpolate(now: Date, start: Date, stop: Date) -> Double {
