@@ -56,6 +56,14 @@ enum SelfTest {
             BrightnessCurve.hardwareLevel(percent: -3, exponential: false, exponent: 1) == 0.0,
             "under-range clamps low")
 
+        // Temperature -> Night Shift strength mapping (documented linear
+        // approximation between 6500K neutral and 2700K warmest).
+        expect(GammaMath.strength(forTemp: 6500) == 0.0, "neutral temp is strength 0")
+        expect(GammaMath.strength(forTemp: 2700) == 1.0, "warmest temp is full strength")
+        expect(abs(GammaMath.strength(forTemp: 4600) - 0.5) < 0.001, "midpoint lands mid-strength")
+        expect(GammaMath.strength(forTemp: 9000) == 0.0, "over-neutral clamps to 0")
+        expect(GammaMath.strength(forTemp: 1000) == 1.0, "under-warmest clamps to 1")
+
         print("selftest: \(checks) checks, \(failed ? "FAILURES above" : "all OK")")
         return failed ? 1 : 0
     }

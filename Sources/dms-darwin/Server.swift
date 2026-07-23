@@ -9,7 +9,10 @@ import Foundation
 // connection, nigiri's MsgServer discipline: a dead client is dropped,
 // never allowed to wedge the loop.
 final class Server {
-    static let apiVersion = 1
+    // v6: the shell gates the gamma (night mode) channel on >= 6. Every
+    // higher version gate in the shell is ALSO gated on a capability this
+    // daemon does not announce, so 6 promises exactly what we serve.
+    static let apiVersion = 6
     static let cliVersion = "dms-darwin 0.1.0"
 
     private let socketPath: String
@@ -18,6 +21,7 @@ final class Server {
     private var connections: [Int32: Connection] = [:]
 
     private let brightness = BrightnessService()
+    private let gamma = GammaChannel()
     // Last state pushed to subscribers, for the poll-driven change detection
     // (the hardware brightness keys change the panel outside our socket).
     private var lastBrightnessPercent: Int?
@@ -49,6 +53,7 @@ final class Server {
     var capabilities: [String] {
         var caps: [String] = []
         if self.brightness.available { caps.append("brightness") }
+        if self.gamma.available { caps.append("gamma") }
         return caps
     }
 
@@ -168,10 +173,26 @@ final class Server {
                     Wire.event(service: "brightness", data: self.brightness.state()),
                     to: connection)
             }
+            if connection.wants("gamma"), self.gamma.available {
+                self.send(Wire.event(service: "gamma", data: self.gamma.state()), to: connection)
+            }
         case "ping":
             self.send(Wire.response(id: request.id, result: "pong"), to: connection)
         case let method where method.hasPrefix("brightness."):
             self.handleBrightness(request, from: connection)
+        case let method where method.hasPrefix("wayland.gamma."):
+            guard self.gamma.available else {
+                self.send(Wire.error(id: request.id, "gamma control unavailable"), to: connection)
+                return
+            }
+            guard let result = self.gamma.handle(method: method, params: request.params) else {
+                self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
+                return
+            }
+            self.send(Wire.response(id: request.id, result: result), to: connection)
+            // Mutations answer SuccessResult, reads answer the state; either
+            // way push fresh state to subscribers (idempotent for reads).
+            self.broadcast(service: "gamma", data: self.gamma.state())
         default:
             self.send(
                 Wire.error(id: request.id, "unknown method: \(request.method)"), to: connection)
