@@ -9,9 +9,10 @@ import Foundation
 // connection, nigiri's MsgServer discipline: a dead client is dropped,
 // never allowed to wedge the loop.
 final class Server {
-    // v6: the shell gates the gamma (night mode) channel on >= 6. Every
-    // higher version gate in the shell is ALSO gated on a capability this
-    // daemon does not announce, so 6 promises exactly what we serve.
+    // v9: the shell gates gamma (night mode) on >= 6 and daemon-side
+    // bluetooth pairing on >= 9 (BluetoothService.qml) - both channels are
+    // served here, so 9 promises exactly what we serve. Any higher gate in
+    // the shell is also gated on a capability this daemon does not announce.
     static let apiVersion = 9
     static let cliVersion = "dms-darwin 0.1.0"
 
