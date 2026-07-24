@@ -724,6 +724,24 @@ esac
 EOF
 chmod +x "$HOME/.local/bin/xdg-open"
 
+# notify-send: DMS sends desktop notifications (battery warnings, errors) via
+# notify-send. Map to `osascript display notification`.
+cat > "$HOME/.local/bin/notify-send" <<'NS_EOF'
+#!/bin/sh
+title=""; body=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -u|-a|-i|-t|-c|-h|-r|--urgency|--app-name|--icon|--category|--hint|--expire-time)
+        shift 2 ;;
+    -e|-p|-w|--*) shift ;;
+    *) if [ -z "$title" ]; then title="$1"; else body="$1"; fi; shift ;;
+    esac
+done
+esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+osascript -e "display notification \"$(esc "$body")\" with title \"$(esc "$title")\""
+NS_EOF
+chmod +x "$HOME/.local/bin/notify-send"
+
 # dgop: the real dgop (github.com/AvengeMedia/dgop) is officially cross-platform
 # and ships signed macOS release binaries, so install the REAL tool - no shim,
 # no port. Powers the system monitor, process list, and CPU/RAM/temp/disk/
@@ -747,6 +765,15 @@ else
     echo "!! dgop: download failed, system monitor stays off ($DGOP_URL)" >&2
 fi
 rm -rf "$DGOP_TMP"
+
+echo ">> Installing ghostty (terminal for the launcher and tmux/mux)"
+# DMS launches a terminal for `run in terminal` desktop entries and tmux
+# attach; it probes for ghostty/kitty/... on PATH. ghostty ships a macOS build.
+[ -x /Applications/Ghostty.app/Contents/MacOS/ghostty ] || brew install --cask ghostty >/dev/null 2>&1 || true
+if [ -x /Applications/Ghostty.app/Contents/MacOS/ghostty ]; then
+    ln -sf /Applications/Ghostty.app/Contents/MacOS/ghostty "$HOME/.local/bin/ghostty"
+    echo "   ghostty CLI linked"
+fi
 
 echo ">> Installing dsearch (filesystem search for the launcher)"
 # danksearch ships no macOS release binary, but its Go source builds and runs
@@ -822,6 +849,8 @@ if [ -x "$HOME/.local/bin/dcal" ]; then
     <key>EnvironmentVariables</key>
     <dict>
         <key>XDG_RUNTIME_DIR</key><string>$HOME/.local/state/dms-run</string>
+        <!-- Post-capture screenshot editor: open in Preview (has markup). -->
+        <key>DMS_SCREENSHOT_EDITOR</key><string>open -a Preview %path%</string>
         <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>RunAtLoad</key><true/>
