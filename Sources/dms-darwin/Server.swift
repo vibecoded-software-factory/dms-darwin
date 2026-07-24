@@ -9,377 +9,403 @@ import Foundation
 // connection, nigiri's MsgServer discipline: a dead client is dropped,
 // never allowed to wedge the loop.
 final class Server {
-    // v9: the shell gates gamma (night mode) on >= 6 and daemon-side
-    // bluetooth pairing on >= 9 (BluetoothService.qml) - both channels are
-    // served here, so 9 promises exactly what we serve. Any higher gate in
-    // the shell is also gated on a capability this daemon does not announce.
-    static let apiVersion = 9
-    static let cliVersion = "dms-darwin 0.1.0"
+  // v9: the shell gates gamma (night mode) on >= 6 and daemon-side
+  // bluetooth pairing on >= 9 (BluetoothService.qml) - both channels are
+  // served here, so 9 promises exactly what we serve. Any higher gate in
+  // the shell is also gated on a capability this daemon does not announce.
+  static let apiVersion = 9
+  static let cliVersion = "dms-darwin 0.1.0"
 
-    private let socketPath: String
-    private var listenFd: Int32 = -1
-    private var acceptSource: DispatchSourceRead?
-    private var connections: [Int32: Connection] = [:]
+  private let socketPath: String
+  private var listenFd: Int32 = -1
+  private var acceptSource: DispatchSourceRead?
+  private var connections: [Int32: Connection] = [:]
 
-    private let brightness = BrightnessService()
-    private let gamma = GammaChannel()
-    private let freedesktop = FreedesktopChannel()
-    private let bluetooth = BluetoothChannel()
-    private let plugins = PluginsChannel()
-    // Registry/git work can take seconds; it never runs on the main loop.
-    private let pluginsQueue = DispatchQueue(label: "dev.dms.plugins")
-    // Last state pushed to subscribers, for the poll-driven change detection
-    // (the hardware brightness keys change the panel outside our socket).
-    private var lastBrightnessPercent: Int?
-    private var pollTimer: DispatchSourceTimer?
+  private let brightness = BrightnessService()
+  private let gamma = GammaChannel()
+  private let freedesktop = FreedesktopChannel()
+  private let bluetooth = BluetoothChannel()
+  private let plugins = PluginsChannel()
+  private let clipboard = ClipboardChannel()
+  // Registry/git work can take seconds; it never runs on the main loop.
+  private let pluginsQueue = DispatchQueue(label: "dev.dms.plugins")
+  // Last state pushed to subscribers, for the poll-driven change detection
+  // (the hardware brightness keys change the panel outside our socket).
+  private var lastBrightnessPercent: Int?
+  private var pollTimer: DispatchSourceTimer?
 
-    private final class Connection {
-        let fd: Int32
-        let source: DispatchSourceRead
-        var buffer = Data()
-        // A connection becomes a subscriber when it sends `subscribe`; from
-        // then on it receives event pushes for these services ([] = all).
-        var subscribedServices: [String]? = nil
+  private final class Connection {
+    let fd: Int32
+    let source: DispatchSourceRead
+    var buffer = Data()
+    // A connection becomes a subscriber when it sends `subscribe`; from
+    // then on it receives event pushes for these services ([] = all).
+    var subscribedServices: [String]? = nil
 
-        init(fd: Int32, source: DispatchSourceRead) {
-            self.fd = fd
-            self.source = source
-        }
-
-        func wants(_ service: String) -> Bool {
-            guard let services = self.subscribedServices else { return false }
-            // Upstream defaults an empty list to ["all"] and honors the
-            // literal "all" (DMSService.subscribeAll sends it).
-            return services.isEmpty || services.contains("all") || services.contains(service)
-        }
+    init(fd: Int32, source: DispatchSourceRead) {
+      self.fd = fd
+      self.source = source
     }
 
-    init(socketPath: String) {
-        self.socketPath = socketPath
+    func wants(_ service: String) -> Bool {
+      guard let services = self.subscribedServices else { return false }
+      // Upstream defaults an empty list to ["all"] and honors the
+      // literal "all" (DMSService.subscribeAll sends it).
+      return services.isEmpty || services.contains("all") || services.contains(service)
+    }
+  }
+
+  init(socketPath: String) {
+    self.socketPath = socketPath
+  }
+
+  var capabilities: [String] {
+    // "plugins" is unconditional upstream (the list can never be empty -
+    // an empty list trips the shell's "empty means clipboard available"
+    // legacy branch). "brightness" announces manager-init like upstream,
+    // which serves an empty device list rather than dropping the channel.
+    var caps: [String] = ["plugins", "brightness"]
+    if self.gamma.available { caps.append("gamma") }
+    if self.freedesktop.available { caps.append("freedesktop") }
+    if self.bluetooth.available { caps.append("bluetooth") }
+    // Clipboard is always serveable on macOS (NSPasteboard), unlike the
+    // Go daemon whose clipboard needs Wayland and is absent here.
+    caps.append("clipboard")
+    return caps
+  }
+
+  func start() -> Bool {
+    unlink(self.socketPath)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return false }
+
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = Array(self.socketPath.utf8)
+    guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { return false }
+    withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+      raw.copyBytes(from: pathBytes)
+    }
+    let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+    let bound = withUnsafePointer(to: &addr) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, size) }
+    }
+    guard bound == 0, listen(fd, 16) == 0 else {
+      close(fd)
+      return false
     }
 
-    var capabilities: [String] {
-        // "plugins" is unconditional upstream (the list can never be empty -
-        // an empty list trips the shell's "empty means clipboard available"
-        // legacy branch). "brightness" announces manager-init like upstream,
-        // which serves an empty device list rather than dropping the channel.
-        var caps: [String] = ["plugins", "brightness"]
-        if self.gamma.available { caps.append("gamma") }
-        if self.freedesktop.available { caps.append("freedesktop") }
-        if self.bluetooth.available { caps.append("bluetooth") }
-        return caps
+    self.listenFd = fd
+    let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+    source.setEventHandler { [weak self] in self?.acceptConnection() }
+    source.resume()
+    self.acceptSource = source
+
+    // Poll for out-of-band brightness changes (the keyboard keys, auto
+    // brightness). 2s is imperceptible for a slider and costs nothing.
+    let timer = DispatchSource.makeTimerSource(queue: .main)
+    timer.schedule(deadline: .now() + 2, repeating: 2)
+    timer.setEventHandler { [weak self] in
+      self?.pollBrightness()
+      // Appearance safety net: App Nap can withhold the theme-change
+      // notification from an idle agent; the poll catches it anyway.
+      self?.freedesktop.pollAppearance()
+    }
+    timer.resume()
+    self.pollTimer = timer
+
+    // The gamma schedule moves the temperature on its own (dawn/dusk
+    // ticks, a geolocation arriving); push the fresh state when it does.
+    self.gamma.onStateChanged = { [weak self] in
+      guard let self else { return }
+      self.broadcast(service: "gamma", data: self.gamma.state())
     }
 
-    func start() -> Bool {
-        unlink(self.socketPath)
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(self.socketPath.utf8)
-        guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { return false }
-        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
-            raw.copyBytes(from: pathBytes)
-        }
-        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let bound = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, size) }
-        }
-        guard bound == 0, listen(fd, 16) == 0 else {
-            close(fd)
-            return false
-        }
-
-        self.listenFd = fd
-        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
-        source.setEventHandler { [weak self] in self?.acceptConnection() }
-        source.resume()
-        self.acceptSource = source
-
-        // Poll for out-of-band brightness changes (the keyboard keys, auto
-        // brightness). 2s is imperceptible for a slider and costs nothing.
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + 2, repeating: 2)
-        timer.setEventHandler { [weak self] in
-            self?.pollBrightness()
-            // Appearance safety net: App Nap can withhold the theme-change
-            // notification from an idle agent; the poll catches it anyway.
-            self?.freedesktop.pollAppearance()
-        }
-        timer.resume()
-        self.pollTimer = timer
-
-        // The gamma schedule moves the temperature on its own (dawn/dusk
-        // ticks, a geolocation arriving); push the fresh state when it does.
-        self.gamma.onStateChanged = { [weak self] in
-            guard let self else { return }
-            self.broadcast(service: "gamma", data: self.gamma.state())
-        }
-
-        // The system appearance changes behind our back (OS auto-switch,
-        // System Settings); the shell follows these broadcasts.
-        self.freedesktop.onStateChanged = { [weak self] in
-            guard let self else { return }
-            self.broadcast(service: "freedesktop", data: self.freedesktop.state())
-        }
-
-        // Pairing prompts drive the shell's BluetoothPairingModal; state
-        // changes keep its device views fresh.
-        self.bluetooth.onPairingPrompt = { [weak self] prompt in
-            guard let self else { return }
-            self.broadcast(service: "bluetooth.pairing", data: prompt)
-        }
-        self.bluetooth.onStateChanged = { [weak self] in
-            guard let self else { return }
-            self.broadcast(service: "bluetooth", data: self.bluetooth.state())
-        }
-
-        print("[server] listening on \(self.socketPath) capabilities=\(self.capabilities)")
-        return true
+    // The system appearance changes behind our back (OS auto-switch,
+    // System Settings); the shell follows these broadcasts.
+    self.freedesktop.onStateChanged = { [weak self] in
+      guard let self else { return }
+      self.broadcast(service: "freedesktop", data: self.freedesktop.state())
     }
 
-    private func acceptConnection() {
-        let fd = accept(self.listenFd, nil, nil)
-        guard fd >= 0 else { return }
-        // A stalled client must never block the daemon in write().
-        var flags = fcntl(fd, F_GETFL)
-        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-        flags = 1
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &flags, socklen_t(MemoryLayout<Int32>.size))
-
-        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
-        let connection = Connection(fd: fd, source: source)
-        self.connections[fd] = connection
-        source.setEventHandler { [weak self] in self?.readFrom(connection) }
-        source.setCancelHandler { close(fd) }
-        source.resume()
+    // Pairing prompts drive the shell's BluetoothPairingModal; state
+    // changes keep its device views fresh.
+    self.bluetooth.onPairingPrompt = { [weak self] prompt in
+      guard let self else { return }
+      self.broadcast(service: "bluetooth.pairing", data: prompt)
+    }
+    self.bluetooth.onStateChanged = { [weak self] in
+      guard let self else { return }
+      self.broadcast(service: "bluetooth", data: self.bluetooth.state())
     }
 
-    private func dropConnection(_ connection: Connection) {
-        self.connections.removeValue(forKey: connection.fd)
-        connection.source.cancel()
+    // NSPasteboard changes (any app copying, our own history writes) push
+    // fresh clipboard state so an open history modal stays live.
+    self.clipboard.onStateChanged = { [weak self] in
+      guard let self else { return }
+      self.broadcast(service: "clipboard", data: self.clipboard.state())
+    }
+    self.clipboard.start()
+
+    print("[server] listening on \(self.socketPath) capabilities=\(self.capabilities)")
+    return true
+  }
+
+  private func acceptConnection() {
+    let fd = accept(self.listenFd, nil, nil)
+    guard fd >= 0 else { return }
+    // A stalled client must never block the daemon in write().
+    var flags = fcntl(fd, F_GETFL)
+    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    flags = 1
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &flags, socklen_t(MemoryLayout<Int32>.size))
+
+    let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+    let connection = Connection(fd: fd, source: source)
+    self.connections[fd] = connection
+    source.setEventHandler { [weak self] in self?.readFrom(connection) }
+    source.setCancelHandler { close(fd) }
+    source.resume()
+  }
+
+  private func dropConnection(_ connection: Connection) {
+    self.connections.removeValue(forKey: connection.fd)
+    connection.source.cancel()
+  }
+
+  private func readFrom(_ connection: Connection) {
+    var scratch = [UInt8](repeating: 0, count: 65536)
+    let count = Darwin.read(connection.fd, &scratch, scratch.count)
+    if count <= 0 {
+      self.dropConnection(connection)
+      return
+    }
+    connection.buffer.append(contentsOf: scratch[0..<count])
+    while let newline = connection.buffer.firstIndex(of: 0x0A) {
+      let line = connection.buffer.prefix(upTo: newline)
+      connection.buffer.removeSubrange(...newline)
+      if !line.isEmpty { self.handleLine(Data(line), from: connection) }
+    }
+  }
+
+  private func send(_ data: Data, to connection: Connection) {
+    let sent = data.withUnsafeBytes { raw in
+      Darwin.write(connection.fd, raw.baseAddress, raw.count)
+    }
+    // Best-effort: a client too slow to take an event gets dropped, the
+    // same policy as the compositor's event stream.
+    if sent < 0 && errno != EAGAIN {
+      print("[server] DROP fd=\(connection.fd) errno=\(errno)")
+      self.dropConnection(connection)
+    } else if sent >= 0 && sent < data.count {
+      print("[server] SHORT WRITE fd=\(connection.fd) sent=\(sent)/\(data.count)")
+    }
+  }
+
+  private func broadcast(service: String, data: Any) {
+    let line = Wire.event(service: service, data: data)
+    for connection in self.connections.values where connection.wants(service) {
+      self.send(line, to: connection)
+    }
+  }
+
+  private func handleLine(_ line: Data, from connection: Connection) {
+    guard let request = Wire.Request.parse(line) else {
+      self.send(Wire.error(id: nil, "malformed request"), to: connection)
+      return
     }
 
-    private func readFrom(_ connection: Connection) {
-        var scratch = [UInt8](repeating: 0, count: 65536)
-        let count = Darwin.read(connection.fd, &scratch, scratch.count)
-        if count <= 0 {
-            self.dropConnection(connection)
-            return
-        }
-        connection.buffer.append(contentsOf: scratch[0..<count])
-        while let newline = connection.buffer.firstIndex(of: 0x0A) {
-            let line = connection.buffer.prefix(upTo: newline)
-            connection.buffer.removeSubrange(...newline)
-            if !line.isEmpty { self.handleLine(Data(line), from: connection) }
-        }
-    }
-
-    private func send(_ data: Data, to connection: Connection) {
-        let sent = data.withUnsafeBytes { raw in
-            Darwin.write(connection.fd, raw.baseAddress, raw.count)
-        }
-        // Best-effort: a client too slow to take an event gets dropped, the
-        // same policy as the compositor's event stream.
-        if sent < 0 && errno != EAGAIN {
-            print("[server] DROP fd=\(connection.fd) errno=\(errno)")
-            self.dropConnection(connection)
-        } else if sent >= 0 && sent < data.count {
-            print("[server] SHORT WRITE fd=\(connection.fd) sent=\(sent)/\(data.count)")
-        }
-    }
-
-    private func broadcast(service: String, data: Any) {
-        let line = Wire.event(service: service, data: data)
-        for connection in self.connections.values where connection.wants(service) {
-            self.send(line, to: connection)
-        }
-    }
-
-    private func handleLine(_ line: Data, from connection: Connection) {
-        guard let request = Wire.Request.parse(line) else {
-            self.send(Wire.error(id: nil, "malformed request"), to: connection)
-            return
-        }
-
-        switch request.method {
-        case "subscribe":
-            connection.subscribedServices = request.params["services"] as? [String] ?? []
-            print(
-                "[server] subscribe fd=\(connection.fd) services=\(connection.subscribedServices ?? [])"
-            )
-            // Handshake first - the shell gates every feature on it - then
-            // the current state of everything subscribed.
+    switch request.method {
+    case "subscribe":
+      connection.subscribedServices = request.params["services"] as? [String] ?? []
+      print(
+        "[server] subscribe fd=\(connection.fd) services=\(connection.subscribedServices ?? [])"
+      )
+      // Handshake first - the shell gates every feature on it - then
+      // the current state of everything subscribed.
+      self.send(
+        Wire.event(
+          service: "server",
+          data: [
+            "apiVersion": Self.apiVersion,
+            "cliVersion": Self.cliVersion,
+            "capabilities": self.capabilities,
+          ]), to: connection)
+      if connection.wants("brightness") {
+        // Upstream pushes initial state even with zero devices.
+        self.send(
+          Wire.event(service: "brightness", data: self.brightness.state()),
+          to: connection)
+      }
+      if connection.wants("gamma"), self.gamma.available {
+        self.send(Wire.event(service: "gamma", data: self.gamma.state()), to: connection)
+      }
+      if connection.wants("freedesktop"), self.freedesktop.available {
+        self.send(
+          Wire.event(service: "freedesktop", data: self.freedesktop.state()),
+          to: connection)
+      }
+      if connection.wants("clipboard") {
+        self.send(
+          Wire.event(service: "clipboard", data: self.clipboard.state()),
+          to: connection)
+      }
+    case "ping":
+      self.send(Wire.response(id: request.id, result: "pong"), to: connection)
+    case let method where method.hasPrefix("brightness."):
+      self.handleBrightness(request, from: connection)
+    case let method where method.hasPrefix("wayland.gamma."):
+      guard self.gamma.available else {
+        self.send(Wire.error(id: request.id, "wayland manager not initialized"), to: connection)
+        return
+      }
+      let outcome = self.gamma.handle(method: method, params: request.params)
+      if let failure = outcome.error {
+        self.send(Wire.error(id: request.id, failure), to: connection)
+        return
+      }
+      guard let result = outcome.result else {
+        self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
+        return
+      }
+      self.send(Wire.response(id: request.id, result: result), to: connection)
+      // Mutations answer SuccessResult, reads answer the state; either
+      // way push fresh state to subscribers (idempotent for reads).
+      self.broadcast(service: "gamma", data: self.gamma.state())
+    case let method where method.hasPrefix("bluetooth."):
+      guard self.bluetooth.available else {
+        self.send(Wire.error(id: request.id, "bluetooth manager not initialized"), to: connection)
+        return
+      }
+      let outcome = self.bluetooth.handle(method: method, params: request.params)
+      if let failure = outcome.error {
+        self.send(Wire.error(id: request.id, failure), to: connection)
+      } else if let result = outcome.result {
+        self.send(Wire.response(id: request.id, result: result), to: connection)
+      } else {
+        self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
+      }
+    case let method where method.hasPrefix("plugins."):
+      let requestCopy = request
+      self.pluginsQueue.async { [weak self] in
+        guard let self else { return }
+        let outcome = self.plugins.handle(method: method, params: requestCopy.params)
+        DispatchQueue.main.async {
+          if let failure = outcome.error {
+            self.send(Wire.error(id: requestCopy.id, failure), to: connection)
+          } else if let result = outcome.result {
+            self.send(Wire.response(id: requestCopy.id, result: result), to: connection)
+          } else {
             self.send(
-                Wire.event(
-                    service: "server",
-                    data: [
-                        "apiVersion": Self.apiVersion,
-                        "cliVersion": Self.cliVersion,
-                        "capabilities": self.capabilities,
-                    ]), to: connection)
-            if connection.wants("brightness") {
-                // Upstream pushes initial state even with zero devices.
-                self.send(
-                    Wire.event(service: "brightness", data: self.brightness.state()),
-                    to: connection)
-            }
-            if connection.wants("gamma"), self.gamma.available {
-                self.send(Wire.event(service: "gamma", data: self.gamma.state()), to: connection)
-            }
-            if connection.wants("freedesktop"), self.freedesktop.available {
-                self.send(
-                    Wire.event(service: "freedesktop", data: self.freedesktop.state()),
-                    to: connection)
-            }
-        case "ping":
-            self.send(Wire.response(id: request.id, result: "pong"), to: connection)
-        case let method where method.hasPrefix("brightness."):
-            self.handleBrightness(request, from: connection)
-        case let method where method.hasPrefix("wayland.gamma."):
-            guard self.gamma.available else {
-                self.send(Wire.error(id: request.id, "wayland manager not initialized"), to: connection)
-                return
-            }
-            let outcome = self.gamma.handle(method: method, params: request.params)
-            if let failure = outcome.error {
-                self.send(Wire.error(id: request.id, failure), to: connection)
-                return
-            }
-            guard let result = outcome.result else {
-                self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
-                return
-            }
-            self.send(Wire.response(id: request.id, result: result), to: connection)
-            // Mutations answer SuccessResult, reads answer the state; either
-            // way push fresh state to subscribers (idempotent for reads).
-            self.broadcast(service: "gamma", data: self.gamma.state())
-        case let method where method.hasPrefix("bluetooth."):
-            guard self.bluetooth.available else {
-                self.send(Wire.error(id: request.id, "bluetooth manager not initialized"), to: connection)
-                return
-            }
-            let outcome = self.bluetooth.handle(method: method, params: request.params)
-            if let failure = outcome.error {
-                self.send(Wire.error(id: request.id, failure), to: connection)
-            } else if let result = outcome.result {
-                self.send(Wire.response(id: request.id, result: result), to: connection)
-            } else {
-                self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
-            }
-        case let method where method.hasPrefix("plugins."):
-            let requestCopy = request
-            self.pluginsQueue.async { [weak self] in
-                guard let self else { return }
-                let outcome = self.plugins.handle(method: method, params: requestCopy.params)
-                DispatchQueue.main.async {
-                    if let failure = outcome.error {
-                        self.send(Wire.error(id: requestCopy.id, failure), to: connection)
-                    } else if let result = outcome.result {
-                        self.send(Wire.response(id: requestCopy.id, result: result), to: connection)
-                    } else {
-                        self.send(
-                            Wire.error(id: requestCopy.id, "unknown method: \(method)"),
-                            to: connection)
-                    }
-                }
-            }
-        case let method where method.hasPrefix("freedesktop."):
-            let outcome = self.freedesktop.handle(method: method, params: request.params)
-            if let failure = outcome.error {
-                self.send(Wire.error(id: request.id, failure), to: connection)
-            } else if let result = outcome.result {
-                self.send(Wire.response(id: request.id, result: result), to: connection)
-            } else {
-                self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
-            }
-        default:
-            self.send(
-                Wire.error(id: request.id, "unknown method: \(request.method)"), to: connection)
+              Wire.error(id: requestCopy.id, "unknown method: \(method)"),
+              to: connection)
+          }
         }
+      }
+    case let method where method.hasPrefix("freedesktop."):
+      let outcome = self.freedesktop.handle(method: method, params: request.params)
+      if let failure = outcome.error {
+        self.send(Wire.error(id: request.id, failure), to: connection)
+      } else if let result = outcome.result {
+        self.send(Wire.response(id: request.id, result: result), to: connection)
+      } else {
+        self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
+      }
+    case let method where method.hasPrefix("clipboard."):
+      let outcome = self.clipboard.handle(method: method, params: request.params)
+      if let failure = outcome.error {
+        self.send(Wire.error(id: request.id, failure), to: connection)
+      } else if let result = outcome.result {
+        self.send(Wire.response(id: request.id, result: result), to: connection)
+      } else {
+        self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
+      }
+    default:
+      self.send(
+        Wire.error(id: request.id, "unknown method: \(request.method)"), to: connection)
+    }
+  }
+
+  // ---- brightness ----
+  //
+  // Method set and response shapes mirror the upstream handlers verbatim:
+  // every mutation answers with the full State and pushes it to
+  // subscribers.
+
+  private func handleBrightness(_ request: Wire.Request, from connection: Connection) {
+    func respondState() {
+      let state = self.brightness.state()
+      self.send(Wire.response(id: request.id, result: state), to: connection)
+      self.lastBrightnessPercent = self.brightness.currentPercent()
+      self.broadcast(service: "brightness", data: state)
     }
 
-    // ---- brightness ----
-    //
-    // Method set and response shapes mirror the upstream handlers verbatim:
-    // every mutation answers with the full State and pushes it to
-    // subscribers.
-
-    private func handleBrightness(_ request: Wire.Request, from connection: Connection) {
-        func respondState() {
-            let state = self.brightness.state()
-            self.send(Wire.response(id: request.id, result: state), to: connection)
-            self.lastBrightnessPercent = self.brightness.currentPercent()
-            self.broadcast(service: "brightness", data: state)
-        }
-
-        // Mutations follow the upstream contract: `device` is required and
-        // must name a known device, and out-of-range percents are errors,
-        // not clamps.
-        func resolveDevice() -> Bool {
-            guard let device = request.params["device"] as? String else {
-                self.send(Wire.error(id: request.id, "missing param: device"), to: connection)
-                return false
-            }
-            guard device == BrightnessService.deviceId, self.brightness.available else {
-                self.send(
-                    Wire.error(id: request.id, "device not found: \(device)"), to: connection)
-                return false
-            }
-            return true
-        }
-
-        switch request.method {
-        case "brightness.getState", "brightness.rescan":
-            self.send(
-                Wire.response(id: request.id, result: self.brightness.state()), to: connection)
-        case "brightness.setBrightness":
-            guard let percent = request.params["percent"] as? Int else {
-                self.send(Wire.error(id: request.id, "missing param: percent"), to: connection)
-                return
-            }
-            guard percent >= 0 && percent <= 100 else {
-                self.send(
-                    Wire.error(id: request.id, "percent out of range: \(percent)"), to: connection)
-                return
-            }
-            guard resolveDevice() else { return }
-            let exponential = request.params["exponential"] as? Bool ?? false
-            let exponent = request.params["exponent"] as? Double ?? 1.2
-            guard self.brightness.set(percent: percent, exponential: exponential, exponent: exponent)
-            else {
-                self.send(Wire.error(id: request.id, "failed to set brightness"), to: connection)
-                return
-            }
-            respondState()
-        case "brightness.increment", "brightness.decrement":
-            guard resolveDevice() else { return }
-            let step = request.params["step"] as? Int ?? 10
-            let signed = request.method.hasSuffix("increment") ? step : -step
-            let current = self.brightness.currentPercent() ?? 0
-            let target = min(100, max(0, current + signed))
-            let exponential = request.params["exponential"] as? Bool ?? false
-            let exponent = request.params["exponent"] as? Double ?? 1.2
-            guard self.brightness.set(percent: target, exponential: exponential, exponent: exponent)
-            else {
-                self.send(Wire.error(id: request.id, "failed to set brightness"), to: connection)
-                return
-            }
-            respondState()
-        default:
-            self.send(
-                Wire.error(id: request.id, "unknown method: \(request.method)"), to: connection)
-        }
+    // Mutations follow the upstream contract: `device` is required and
+    // must name a known device, and out-of-range percents are errors,
+    // not clamps.
+    func resolveDevice() -> Bool {
+      guard let device = request.params["device"] as? String else {
+        self.send(Wire.error(id: request.id, "missing param: device"), to: connection)
+        return false
+      }
+      guard device == BrightnessService.deviceId, self.brightness.available else {
+        self.send(
+          Wire.error(id: request.id, "device not found: \(device)"), to: connection)
+        return false
+      }
+      return true
     }
 
-    // The hardware brightness keys and auto-brightness change the panel
-    // behind our back; poll and push so the shell's slider follows.
-    private func pollBrightness() {
-        guard self.brightness.available else { return }
-        let percent = self.brightness.currentPercent()
-        guard percent != self.lastBrightnessPercent else { return }
-        self.lastBrightnessPercent = percent
-        self.broadcast(service: "brightness", data: self.brightness.state())
+    switch request.method {
+    case "brightness.getState", "brightness.rescan":
+      self.send(
+        Wire.response(id: request.id, result: self.brightness.state()), to: connection)
+    case "brightness.setBrightness":
+      guard let percent = request.params["percent"] as? Int else {
+        self.send(Wire.error(id: request.id, "missing param: percent"), to: connection)
+        return
+      }
+      guard percent >= 0 && percent <= 100 else {
+        self.send(
+          Wire.error(id: request.id, "percent out of range: \(percent)"), to: connection)
+        return
+      }
+      guard resolveDevice() else { return }
+      let exponential = request.params["exponential"] as? Bool ?? false
+      let exponent = request.params["exponent"] as? Double ?? 1.2
+      guard self.brightness.set(percent: percent, exponential: exponential, exponent: exponent)
+      else {
+        self.send(Wire.error(id: request.id, "failed to set brightness"), to: connection)
+        return
+      }
+      respondState()
+    case "brightness.increment", "brightness.decrement":
+      guard resolveDevice() else { return }
+      let step = request.params["step"] as? Int ?? 10
+      let signed = request.method.hasSuffix("increment") ? step : -step
+      let current = self.brightness.currentPercent() ?? 0
+      let target = min(100, max(0, current + signed))
+      let exponential = request.params["exponential"] as? Bool ?? false
+      let exponent = request.params["exponent"] as? Double ?? 1.2
+      guard self.brightness.set(percent: target, exponential: exponential, exponent: exponent)
+      else {
+        self.send(Wire.error(id: request.id, "failed to set brightness"), to: connection)
+        return
+      }
+      respondState()
+    default:
+      self.send(
+        Wire.error(id: request.id, "unknown method: \(request.method)"), to: connection)
     }
+  }
+
+  // The hardware brightness keys and auto-brightness change the panel
+  // behind our back; poll and push so the shell's slider follows.
+  private func pollBrightness() {
+    guard self.brightness.available else { return }
+    let percent = self.brightness.currentPercent()
+    guard percent != self.lastBrightnessPercent else { return }
+    self.lastBrightnessPercent = percent
+    self.broadcast(service: "brightness", data: self.brightness.state())
+  }
 }

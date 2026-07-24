@@ -39,12 +39,16 @@ func resolveGo(pat string) string {
 
 // Method prefixes the Swift dms-darwin daemon serves on macOS (from
 // Server.swift's route table). Everything else -> the Go daemon.
-var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "freedesktop."}
+// clipboard.* is Swift-owned: the Go daemon's clipboard channel needs a
+// Wayland ext-data-control device and never initializes on macOS, so the
+// Swift daemon (NSPasteboard) is the only one that serves it.
+var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "freedesktop.", "clipboard."}
 
 // Event `service` names the Swift daemon owns; the same-named event from the
 // (hollow) Go daemon must be dropped so DMS sees only the real one.
 var swiftEventServices = map[string]bool{
 	"brightness": true, "gamma": true, "bluetooth": true, "freedesktop": true,
+	"clipboard": true,
 }
 
 func toSwift(method string) bool {
