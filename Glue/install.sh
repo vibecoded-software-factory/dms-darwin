@@ -594,6 +594,50 @@ else
 fi
 rm -rf "$DGOP_TMP"
 
+echo ">> Installing dsearch (filesystem search for the launcher)"
+# danksearch ships no macOS release binary, but its Go source builds and runs
+# on darwin (Bleve index, cross-platform). Build the pinned release from source
+# (needs go; installed via brew). DMS queries the index via `dsearch search`;
+# it does NOT start the indexer, so we run `dsearch serve` as a launch agent.
+command -v go >/dev/null 2>&1 || brew install go >/dev/null 2>&1 || true
+DSEARCH_VERSION="${DSEARCH_VERSION:-v0.3.2}"
+DSEARCH_SRC=$(mktemp -d)
+if git clone --quiet --depth 1 --branch "$DSEARCH_VERSION" \
+    https://github.com/AvengeMedia/danksearch "$DSEARCH_SRC" 2>/dev/null; then
+    ( cd "$DSEARCH_SRC" && GOFLAGS=-mod=mod go build -o "$HOME/.local/bin/dsearch" ./cmd/dsearch ) \
+        && echo "   dsearch $DSEARCH_VERSION built" || echo "!! dsearch build failed" >&2
+else
+    echo "!! dsearch: clone failed, launcher file search stays off" >&2
+fi
+rm -rf "$DSEARCH_SRC"
+if [ -x "$HOME/.local/bin/dsearch" ]; then
+    DSEARCH_PLIST="$HOME/Library/LaunchAgents/dev.dsearch.plist"
+    cat > "$DSEARCH_PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>dev.dsearch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$HOME/.local/bin/dsearch</string>
+        <string>serve</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict><key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>StandardOutPath</key><string>/tmp/dsearch.log</string>
+    <key>StandardErrorPath</key><string>/tmp/dsearch.log</string>
+    <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+PLIST_EOF
+    launchctl bootout "gui/$(id -u)/dev.dsearch" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$DSEARCH_PLIST" 2>/dev/null || true
+    echo "   dev.dsearch agent (re)started"
+fi
+
 echo ">> Installing the launch agent $LABEL"
 mkdir -p "$HOME/Library/LaunchAgents"
 cat > "$PLIST" <<EOF
