@@ -332,6 +332,18 @@ EOF
 sed -i '' -e "s|__LABEL__|$LABEL|g" -e "s|__APP__|$APP|g" -e "s|__SHELL_DIR__|$SHELL_DIR|g" "$HOME/.local/bin/dms"
 chmod +x "$HOME/.local/bin/dms"
 
+echo ">> Ensuring matugen (Material-You color generation) is on PATH"
+# matugen drives DMS's dynamic theming (via `dms matugen queue`). It must be on
+# the launchd agent PATH (~/.local/bin, /opt/homebrew/bin). Prefer brew; else
+# cargo install + symlink into ~/.local/bin.
+if ! command -v matugen >/dev/null 2>&1; then
+    brew install matugen >/dev/null 2>&1 \
+        || { command -v cargo >/dev/null 2>&1 && cargo install matugen >/dev/null 2>&1; }
+fi
+if ! [ -x /opt/homebrew/bin/matugen ] && [ -x "$HOME/.cargo/bin/matugen" ]; then
+    ln -sf "$HOME/.cargo/bin/matugen" "$HOME/.local/bin/matugen"
+fi
+
 echo ">> Building the real dms CLI (dms-real: matugen/keybinds/config)"
 # The dms CLI subcommands the shim forwards (matugen queue, keybinds, config,
 # setup, update) are Go and BUILD+RUN on macOS - only 5 tiny darwin platform
