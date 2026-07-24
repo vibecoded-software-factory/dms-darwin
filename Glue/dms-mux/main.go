@@ -47,13 +47,15 @@ func resolveGo(pat string) string {
 // socket and its TCP listener is only up while cupsd is awake, so the Go init
 // hits "connection refused". The Swift channel drives the CUPS CLI, which uses
 // the always-available domain socket.
-var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "freedesktop.", "clipboard.", "cups."}
+// evdev.* (Caps Lock) is Swift-owned too: the Go daemon reads a Linux
+// /dev/input device; the Swift channel reads CGEventSource on macOS.
+var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "freedesktop.", "clipboard.", "cups.", "evdev."}
 
 // Event `service` names the Swift daemon owns; the same-named event from the
 // (hollow) Go daemon must be dropped so DMS sees only the real one.
 var swiftEventServices = map[string]bool{
 	"brightness": true, "gamma": true, "bluetooth": true, "freedesktop": true,
-	"clipboard": true, "cups": true,
+	"clipboard": true, "cups": true, "evdev": true,
 }
 
 func toSwift(method string) bool {

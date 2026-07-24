@@ -28,6 +28,7 @@ final class Server {
   private let plugins = PluginsChannel()
   private let clipboard = ClipboardChannel()
   private let cups = CupsChannel()
+  private let evdev = EvdevChannel()
   // Registry/git work can take seconds; it never runs on the main loop.
   private let pluginsQueue = DispatchQueue(label: "dev.dms.plugins")
   // CUPS CLI calls (lpinfo -v probes network backends for tens of seconds)
@@ -77,6 +78,8 @@ final class Server {
     caps.append("clipboard")
     // macOS ships cupsd; served via the CUPS CLI over its domain socket.
     caps.append("cups")
+    // Caps Lock state via CGEventSource; drives the indicator/OSD.
+    caps.append("evdev")
     return caps
   }
 
@@ -159,6 +162,12 @@ final class Server {
       self?.broadcast(service: "cups", data: snapshot)
     }
     self.cups.start()
+
+    // Caps Lock toggles push a fresh evdev state (indicator/OSD/lock warning).
+    self.evdev.onStateChanged = { [weak self] snapshot in
+      self?.broadcast(service: "evdev", data: snapshot)
+    }
+    self.evdev.start()
 
     print("[server] listening on \(self.socketPath) capabilities=\(self.capabilities)")
     return true
@@ -268,6 +277,11 @@ final class Server {
           Wire.event(service: "cups", data: self.cups.state()),
           to: connection)
       }
+      if connection.wants("evdev") {
+        self.send(
+          Wire.event(service: "evdev", data: self.evdev.state()),
+          to: connection)
+      }
     case "ping":
       self.send(Wire.response(id: request.id, result: "pong"), to: connection)
     case let method where method.hasPrefix("brightness."):
@@ -353,6 +367,15 @@ final class Server {
               Wire.error(id: requestCopy.id, "unknown method: \(method)"), to: connection)
           }
         }
+      }
+    case let method where method.hasPrefix("evdev."):
+      let outcome = self.evdev.handle(method: method, params: request.params)
+      if let failure = outcome.error {
+        self.send(Wire.error(id: request.id, failure), to: connection)
+      } else if let result = outcome.result {
+        self.send(Wire.response(id: request.id, result: result), to: connection)
+      } else {
+        self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
       }
     default:
       self.send(
