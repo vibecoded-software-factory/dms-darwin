@@ -42,13 +42,18 @@ func resolveGo(pat string) string {
 // clipboard.* is Swift-owned: the Go daemon's clipboard channel needs a
 // Wayland ext-data-control device and never initializes on macOS, so the
 // Swift daemon (NSPasteboard) is the only one that serves it.
-var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "freedesktop.", "clipboard."}
+// cups.* is Swift-owned too: the Go daemon's IPP client dials cupsd over TCP
+// localhost:631, but macOS's cupsd is launchd-socket-activated on its domain
+// socket and its TCP listener is only up while cupsd is awake, so the Go init
+// hits "connection refused". The Swift channel drives the CUPS CLI, which uses
+// the always-available domain socket.
+var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "freedesktop.", "clipboard.", "cups."}
 
 // Event `service` names the Swift daemon owns; the same-named event from the
 // (hollow) Go daemon must be dropped so DMS sees only the real one.
 var swiftEventServices = map[string]bool{
 	"brightness": true, "gamma": true, "bluetooth": true, "freedesktop": true,
-	"clipboard": true,
+	"clipboard": true, "cups": true,
 }
 
 func toSwift(method string) bool {
