@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 // dms-darwin: a macOS daemon speaking the DankMaterialShell daemon protocol
@@ -35,6 +36,17 @@ case "audio-tap":
   // process).
   let fifo = arguments.count > 2 ? arguments[2] : "/tmp/dms-audio-tap.fifo"
   exit(AudioTap(fifoPath: fifo).run())
+case "wifi-helper":
+  // The foreground CoreWLAN worker NetworkChannel open-launches (see
+  // WiFiHelper.swift): macOS only unlocks WiFi SSID names for an app started
+  // through LaunchServices, not a background launchd agent. LSUIElement, so no
+  // Dock icon and no focus theft.
+  setvbuf(stdout, nil, _IOLBF, 0)
+  let helperApp = NSApplication.shared
+  helperApp.setActivationPolicy(.accessory)
+  let helper = WiFiHelper()
+  helper.run()
+  helperApp.run()
 case "color-pick":
   // The shell's DankColorPickerModal spawns `dms color pick --json` and
   // reads {"hex":"#RRGGBB"}. The Go CLI drives a Wayland screencopy pick;
@@ -52,12 +64,20 @@ case "serve":
     options: [.userInitiatedAllowingIdleSystemSleep],
     reason: "event delivery must survive idle (App Nap drops notifications)")
   _ = activity
+  // Become a real (headless, accessory) app BEFORE any service starts:
+  // CLLocationManager (the network channel's WiFi-SSID gate) is killed by TCC
+  // (OS_REASON_TCC) when used from a bare run-loop process, and the prompt
+  // needs an app context. LSUIElement keeps it out of the Dock; NSApp.run
+  // drives the same main run loop RunLoop.main.run did, so the GCD main-queue
+  // sources and DispatchSource timers keep firing.
+  let app = NSApplication.shared
+  app.setActivationPolicy(.accessory)
   let server = Server(socketPath: defaultSocketPath())
   guard server.start() else {
     print("[server] failed to bind \(defaultSocketPath())")
     exit(1)
   }
-  RunLoop.main.run()
+  app.run()
 default:
   print("usage: dms-darwin [serve|selftest|version|lock|audio-tap]")
   exit(64)
