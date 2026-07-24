@@ -237,7 +237,10 @@ cat > "$HOME/.local/bin/dms" <<'EOF'
 #   dms restart      restart the shell agent (the power menu's "Restart DMS")
 #   dms ipc ...      forward to the shell's IPC (bento's ipc CLI)
 #   dms cl copy ...  copy text to the clipboard (pbcopy)
+#   dms clipboard copy   copy STDIN to the clipboard (pbcopy)
 #   dms dl ...       fetch a URL to stdout (curl), used by location search
+#   dms blur check   report whether panel blur is supported (it is not: 'unsupported')
+#   dms trash count|put <path>|empty   dock trash over ~/.Trash / Finder
 case "$1" in
 restart)
     exec launchctl kickstart -k "gui/$(id -u)/__LABEL__"
@@ -271,8 +274,51 @@ dl)
     echo "dms (darwin shim): dl needs a url" >&2
     exit 1
     ;;
+clipboard)
+    # The Notepad's "copy to clipboard" pipes content in on stdin
+    # (NotepadTextEditor.qml). pbcopy reads stdin verbatim.
+    if [ "$2" = "copy" ]; then
+        pbcopy
+        exit 0
+    fi
+    echo "dms (darwin shim): clipboard subcommand '$2' is not ported" >&2
+    exit 1
+    ;;
+blur)
+    # bento does not back panels with a blur surface on macOS yet, so report
+    # unsupported. Exit 0 so BlurService.qml does not log a probe failure.
+    [ "$2" = "check" ] && { echo unsupported; exit 0; }
+    echo "dms (darwin shim): blur subcommand '$2' is not ported" >&2
+    exit 1
+    ;;
+trash)
+    # Dock trash over the macOS trash, ALL via Finder: reading ~/.Trash
+    # directly is TCC-blocked ("Operation not permitted") without Full Disk
+    # Access, but Finder itself has access, so count/put/empty go through it
+    # and only need an Automation -> Finder grant (the bundle already declares
+    # NSAppleEventsUsageDescription). DMS shows its own confirm before empty.
+    case "$2" in
+    count)
+        osascript -e 'tell application "Finder" to count items of trash' 2>/dev/null || echo 0
+        ;;
+    put)
+        shift 2
+        for f in "$@"; do
+            [ -e "$f" ] || continue
+            osascript -e "tell application \"Finder\" to delete (POSIX file \"$f\" as alias)" >/dev/null 2>&1
+        done
+        ;;
+    empty)
+        osascript -e 'tell application "Finder" to empty the trash' >/dev/null 2>&1
+        ;;
+    *)
+        echo "dms (darwin shim): trash subcommand '$2' is not ported" >&2
+        exit 1
+        ;;
+    esac
+    ;;
 *)
-    echo "dms (darwin shim): subcommand '$1' is not ported; available: restart, ipc, cl copy, dl" >&2
+    echo "dms (darwin shim): subcommand '$1' is not ported; available: restart, ipc, cl copy, clipboard copy, dl, blur check, trash" >&2
     exit 1
     ;;
 esac
@@ -302,6 +348,20 @@ if [ "$1" = "set" ] && [ "$2" = "org.gnome.desktop.interface" ] \
     *) dark=false ;;
     esac
     exec osascript -e "tell application \"System Events\" to tell appearance preferences to set dark mode to $dark"
+fi
+# Sound theme name: macOS has no GTK sound-theme concept, so round-trip the
+# value through a state file (AudioService reads it back and resolves sounds
+# from the theme dirs). get prints 'value' quoted, as gsettings does.
+if [ "$2" = "org.gnome.desktop.sound" ] && [ "$3" = "theme-name" ]; then
+    STATE="$HOME/.local/state/dms-sound-theme"
+    if [ "$1" = "get" ]; then
+        printf "'%s'\n" "$(cat "$STATE" 2>/dev/null)"
+        exit 0
+    elif [ "$1" = "set" ]; then
+        mkdir -p "$(dirname "$STATE")"
+        printf '%s' "$4" > "$STATE"
+        exit 0
+    fi
 fi
 echo "gsettings (darwin shim): schema not served: $*" >&2
 exit 1
@@ -381,13 +441,21 @@ def main(argv):
     cmd, args = argv[0], argv[1:]
     if cmd == "validate":
         # niri validate checks the config; the macOS analogue is nigiri's own
-        # parser report. Absence of the binary is not a config error - note it
-        # on stderr (DMS only toasts on a NONZERO exit) and pass.
+        # parser report. `validate -c <file>` validates a CANDIDATE file (DMS
+        # writes a temp config and validates it before applying) - honor it, or
+        # nigiri would validate the LIVE config and pass a bad candidate.
+        cfg = None
+        if "-c" in args:
+            i = args.index("-c")
+            if i + 1 < len(args):
+                cfg = args[i + 1]
         nigiri = find_nigiri()
         if nigiri is None:
             print("niri shim: nigiri binary not found; config not validated", file=sys.stderr)
             return 0
-        proc = subprocess.run([nigiri, "check-config"], capture_output=True, text=True)
+        proc = subprocess.run(
+            [nigiri, "check-config"] + ([cfg] if cfg else []), capture_output=True, text=True
+        )
         sys.stderr.write(proc.stdout + proc.stderr)  # niri validate reports over stderr
         return proc.returncode
     if cmd == "msg":
@@ -403,6 +471,16 @@ def main(argv):
             # display configuration.
             name = args[1] if len(args) > 1 else ""
             reply = request({"Output": {"output": name, "action": args[2:]}})
+        elif sub == "action":
+            # Request::Action { action: <tagged enum> }. Map the kebab action
+            # name to niri's PascalCase tag (load-config-file -> LoadConfigFile)
+            # so the request is well-formed; nigiri answers Ok or an honest Err
+            # per whether it implements that action.
+            if len(args) < 2:
+                print("usage: niri msg action <name> [args...]", file=sys.stderr)
+                return 1
+            tag = "".join(w.capitalize() for w in args[1].split("-"))
+            reply = request({"Action": {tag: {}}})
         else:
             # kebab-case subcommand -> niri's PascalCase request (outputs ->
             # "Outputs", focused-window -> "FocusedWindow", ...).
@@ -429,6 +507,68 @@ if __name__ == "__main__":
         sys.exit(1)
 EOF
 chmod +x "$HOME/.local/bin/niri"
+
+# getent: DMS resolves the current user's full name via
+# `getent passwd $USER | cut -d: -f5` and enumerates users/groups. macOS uses
+# Directory Services; emit the Linux 7-field passwd / 4-field group shape from
+# `id`/`dscl`. NOTE: DMS's user-list filter requires uid>=1000 and Linux
+# wheel/sudo groups; macOS uids are 500-502 and its admin group is `admin`, so
+# the Settings > Users list stays empty by DMS's own assumptions - this shim
+# only makes the current-user full name (UserInfoService) resolve, which it does.
+cat > "$HOME/.local/bin/getent" <<'EOF'
+#!/bin/sh
+# getent - darwin stand-in over id/dscl. Generated by install.sh.
+db="$1"; key="$2"
+emit_passwd() {
+    u="$1"
+    uid=$(id -u "$u" 2>/dev/null) || return 1
+    gid=$(id -g "$u" 2>/dev/null)
+    gecos=$(id -F "$u" 2>/dev/null | sed 's/[[:space:]]*$//')
+    home=$(dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    shell=$(dscl . -read "/Users/$u" UserShell 2>/dev/null | awk '{print $2}')
+    printf '%s:*:%s:%s:%s:%s:%s\n' "$u" "$uid" "$gid" "$gecos" "$home" "$shell"
+}
+case "$db" in
+passwd)
+    if [ -n "$key" ]; then
+        emit_passwd "$key" || exit 2
+        exit 0
+    fi
+    dscl . -list /Users UniqueID | while read name uid; do
+        [ "$uid" -ge 500 ] 2>/dev/null || continue
+        emit_passwd "$name"
+    done
+    ;;
+group)
+    if [ -n "$key" ]; then
+        gid=$(dscl . -read "/Groups/$key" PrimaryGroupID 2>/dev/null | awk '{print $2}')
+        [ -z "$gid" ] && exit 2
+        members=$(dscl . -read "/Groups/$key" GroupMembership 2>/dev/null | cut -d' ' -f2- | tr ' ' ',')
+        printf '%s:*:%s:%s\n' "$key" "$gid" "$members"
+        exit 0
+    fi
+    exit 2
+    ;;
+*)
+    exit 2
+    ;;
+esac
+EOF
+chmod +x "$HOME/.local/bin/getent"
+
+# xdg-open: DMS's trash "open" and a few other paths call xdg-open. Map to the
+# native `open`, translating the trash URI to ~/.Trash.
+cat > "$HOME/.local/bin/xdg-open" <<'EOF'
+#!/bin/sh
+# xdg-open - darwin stand-in over `open`. Generated by install.sh.
+t="$1"
+case "$t" in
+trash://*|trash:*) exec open "$HOME/.Trash" ;;
+file://*)          exec open "${t#file://}" ;;
+*)                 exec open "$t" ;;
+esac
+EOF
+chmod +x "$HOME/.local/bin/xdg-open"
 
 echo ">> Installing the launch agent $LABEL"
 mkdir -p "$HOME/Library/LaunchAgents"
