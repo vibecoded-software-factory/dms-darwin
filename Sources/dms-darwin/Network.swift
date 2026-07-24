@@ -132,7 +132,7 @@ final class NetworkChannel {
     let app = "\(NSHomeDirectory())/Applications/DmsDarwin.app"
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    task.arguments = ["-g", "-n", "-a", app, "--args", "wifi-helper"]
+    task.arguments = ["-g", "-a", app, "--args", "wifi-helper"]
     try? task.run()
   }
 
