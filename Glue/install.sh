@@ -638,6 +638,51 @@ PLIST_EOF
     echo "   dev.dsearch agent (re)started"
 fi
 
+echo ">> Installing dcal (calendar: local, Google, Microsoft, CalDAV, iCloud)"
+# dankcalendar ships no macOS release binary, but its Go source builds and runs
+# on darwin out of the box (native iCloud/Google/CalDAV support). Build from
+# source and run `dcal daemon` (the UI-less IPC mode; the `run` mode DMS calls
+# needs an embedded UI our source build lacks) as a launch agent. DMS discovers
+# the socket via XDG_RUNTIME_DIR, which the bento plist above pins to the same
+# dir. Add your calendar account with `dcal account add icloud` (interactive).
+command -v go >/dev/null 2>&1 || brew install go >/dev/null 2>&1 || true
+mkdir -p "$HOME/.local/state/dms-run" && chmod 700 "$HOME/.local/state/dms-run"
+DCAL_SRC=$(mktemp -d)
+if git clone --quiet --depth 1 https://github.com/AvengeMedia/dankcalendar "$DCAL_SRC" 2>/dev/null; then
+    ( cd "$DCAL_SRC" && GOFLAGS=-mod=mod go build -o "$HOME/.local/bin/dcal" ./core/cmd/dcal ) \
+        && echo "   dcal built" || echo "!! dcal build failed" >&2
+else
+    echo "!! dcal: clone failed, calendar backend stays off" >&2
+fi
+rm -rf "$DCAL_SRC"
+if [ -x "$HOME/.local/bin/dcal" ]; then
+    DCAL_PLIST="$HOME/Library/LaunchAgents/dev.dcal.plist"
+    cat > "$DCAL_PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>dev.dcal</string>
+    <key>ProgramArguments</key>
+    <array><string>$HOME/.local/bin/dcal</string><string>daemon</string></array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>XDG_RUNTIME_DIR</key><string>$HOME/.local/state/dms-run</string>
+        <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>StandardOutPath</key><string>/tmp/dcal.log</string>
+    <key>StandardErrorPath</key><string>/tmp/dcal.log</string>
+    <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+PLIST_EOF
+    launchctl bootout "gui/$(id -u)/dev.dcal" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$DCAL_PLIST" 2>/dev/null || true
+    echo "   dev.dcal agent (re)started - add an account: dcal account add icloud"
+fi
+
 echo ">> Installing the launch agent $LABEL"
 mkdir -p "$HOME/Library/LaunchAgents"
 cat > "$PLIST" <<EOF
@@ -657,6 +702,9 @@ cat > "$PLIST" <<EOF
          shell finds the compositor regardless of startup order. -->
     <key>EnvironmentVariables</key>
     <dict>
+        <!-- dcal (and other XDG tools) create their runtime sockets here; DMS's
+             own socket discovery reads the same dir, so keep them aligned. -->
+        <key>XDG_RUNTIME_DIR</key><string>$HOME/.local/state/dms-run</string>
         <key>NIRI_SOCKET</key><string>$NIRI_SOCKET</string>
         <key>NIGIRI_SOCKET</key><string>$NIRI_SOCKET</string>
         <key>DMS_SOCKET</key><string>$DMS_SOCKET</string>
