@@ -734,19 +734,48 @@ esac
 EOF
 chmod +x "$HOME/.local/bin/xdg-open"
 
-# notify-send: DMS sends desktop notifications (battery warnings, errors) via
-# notify-send. Map to `osascript display notification`.
+# notify-send: DMS raises its own alerts (battery, portal errors) through
+# notify-send, as can any app/script. Deliver each to the DMS NotificationServer
+# socket (bento's Quickshell.Services.Notifications backend) so DMS's own popups
+# and notification center light up - the macOS analog of being the freedesktop
+# notification server. Fall back to the system Notification Center when the
+# shell is not running so nothing is silently lost.
 cat > "$HOME/.local/bin/notify-send" <<'NS_EOF'
 #!/bin/sh
-title=""; body=""
+SOCK=/tmp/dms-notifications.sock
+urgency=1; app=""; icon=""; timeout=-1; replace=0; title=""; body=""
 while [ $# -gt 0 ]; do
     case "$1" in
-    -u|-a|-i|-t|-c|-h|-r|--urgency|--app-name|--icon|--category|--hint|--expire-time)
+    -u|--urgency)
+        case "$2" in low) urgency=0 ;; critical) urgency=2 ;; *) urgency=1 ;; esac
         shift 2 ;;
+    -a|--app-name) app="$2"; shift 2 ;;
+    -i|--icon) icon="$2"; shift 2 ;;
+    -t|--expire-time) timeout="$2"; shift 2 ;;
+    -r|--replace-id) replace="$2"; shift 2 ;;
+    -c|--category|-h|--hint) shift 2 ;;
     -e|-p|-w|--*) shift ;;
     *) if [ -z "$title" ]; then title="$1"; else body="$1"; fi; shift ;;
     esac
 done
+
+if [ -S "$SOCK" ] && \
+    SOCK_PATH="$SOCK" APP="$app" ICON="$icon" URG="$urgency" TO="$timeout" \
+    REPL="$replace" TITLE="$title" BODY="$body" python3 -c '
+import os, socket, json, sys
+o = {"appName": os.environ["APP"] or "notify-send", "appIcon": os.environ["ICON"],
+     "summary": os.environ["TITLE"], "body": os.environ["BODY"],
+     "urgency": int(os.environ["URG"]), "expireTimeout": float(os.environ["TO"]),
+     "replacesId": int(os.environ["REPL"] or 0)}
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(1)
+    s.connect(os.environ["SOCK_PATH"]); s.sendall((json.dumps(o) + "\n").encode()); s.close()
+except Exception:
+    sys.exit(1)
+' 2>/dev/null; then
+    exit 0
+fi
+
 esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 osascript -e "display notification \"$(esc "$body")\" with title \"$(esc "$title")\""
 NS_EOF
