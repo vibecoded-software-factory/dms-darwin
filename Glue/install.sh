@@ -291,6 +291,16 @@ blur)
     echo "dms (darwin shim): blur subcommand '$2' is not ported" >&2
     exit 1
     ;;
+color)
+    # `dms color pick --json` -> the DankColorPickerModal eyedropper. The Go
+    # CLI samples via Wayland screencopy; the niri path is inert. dms-darwin
+    # drives the native NSColorSampler and prints {"hex":"#RRGGBB"}.
+    if [ "$2" = "pick" ]; then
+        exec dms-darwin color-pick
+    fi
+    echo "dms (darwin shim): color subcommand '$2' is not ported" >&2
+    exit 1
+    ;;
 trash)
     # Dock trash over the macOS trash, ALL via Finder: reading ~/.Trash
     # directly is TCC-blocked ("Operation not permitted") without Full Disk
