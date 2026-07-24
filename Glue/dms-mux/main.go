@@ -52,14 +52,14 @@ func resolveGo(pat string) string {
 // network.* (WiFi/Ethernet/VPN) is Swift-owned: the Go daemon's backend is
 // NetworkManager/iwd D-Bus (Linux-only); the Swift channel uses CoreWLAN +
 // SystemConfiguration + scutil.
-var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "freedesktop.", "clipboard.", "cups.", "evdev.", "network."}
+var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "freedesktop.", "clipboard.", "cups.", "evdev.", "network.", "loginctl."}
 
 // Event `service` names the Swift daemon owns; the same-named event from the
 // (hollow) Go daemon must be dropped so DMS sees only the real one.
 var swiftEventServices = map[string]bool{
 	"brightness": true, "gamma": true, "bluetooth": true, "freedesktop": true,
 	"clipboard": true, "cups": true, "evdev": true,
-	"network": true, "network.credentials": true,
+	"network": true, "network.credentials": true, "loginctl": true,
 }
 
 func toSwift(method string) bool {

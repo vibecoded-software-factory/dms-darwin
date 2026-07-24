@@ -720,6 +720,22 @@ esac
 EOF
 chmod +x "$HOME/.local/bin/getent"
 
+# cp: DMS runs GNU-only flags (cp --no-preserve=mode, in NiriService's blur-rule
+# copy) that BSD cp rejects with a usage error (exit 64). Strip the GNU-only
+# flags and delegate to the real cp; plain cp passes through unchanged.
+cat > "$HOME/.local/bin/cp" <<'CP_EOF'
+#!/bin/sh
+args=""
+for a in "$@"; do
+    case "$a" in
+    --no-preserve=*|--preserve=*|--reflink*|--sparse=*) ;;
+    *) args="$args \"$a\"" ;;
+    esac
+done
+eval exec /bin/cp $args
+CP_EOF
+chmod +x "$HOME/.local/bin/cp"
+
 # xdg-open: DMS's trash "open" and a few other paths call xdg-open. Map to the
 # native `open`, translating the trash URI to ~/.Trash.
 cat > "$HOME/.local/bin/xdg-open" <<'EOF'
