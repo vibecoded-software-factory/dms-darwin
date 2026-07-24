@@ -30,6 +30,7 @@ final class Server {
   private let cups = CupsChannel()
   private let evdev = EvdevChannel()
   private let network = NetworkChannel()
+  private let loginctl = LoginctlChannel()
   // Registry/git work can take seconds; it never runs on the main loop.
   private let pluginsQueue = DispatchQueue(label: "dev.dms.plugins")
   // CUPS CLI calls (lpinfo -v probes network backends for tens of seconds)
@@ -93,6 +94,8 @@ final class Server {
     // + VPN (scutil). macOS only unlocks WiFi SSID names for a LaunchServices-
     // started app, so NetworkChannel open-launches WiFiHelper for that part.
     caps.append("network")
+    // Sleep/wake + screen-lock state for lock-before-suspend / resume recovery.
+    caps.append("loginctl")
     return caps
   }
 
@@ -187,6 +190,12 @@ final class Server {
       self?.broadcast(service: "network", data: snapshot)
     }
     self.network.start()
+
+    // NSWorkspace sleep/wake + screen lock drive lock-before-suspend.
+    self.loginctl.onStateChanged = { [weak self] snapshot in
+      self?.broadcast(service: "loginctl", data: snapshot)
+    }
+    self.loginctl.start()
 
     print("[server] listening on \(self.socketPath) capabilities=\(self.capabilities)")
     return true
@@ -336,6 +345,9 @@ final class Server {
           }
         }
       }
+      if connection.wants("loginctl") {
+        self.send(Wire.event(service: "loginctl", data: self.loginctl.state()), to: connection)
+      }
     case "ping":
       self.send(Wire.response(id: request.id, result: "pong"), to: connection)
     case let method where method.hasPrefix("brightness."):
@@ -424,6 +436,15 @@ final class Server {
       }
     case let method where method.hasPrefix("evdev."):
       let outcome = self.evdev.handle(method: method, params: request.params)
+      if let failure = outcome.error {
+        self.send(Wire.error(id: request.id, failure), to: connection)
+      } else if let result = outcome.result {
+        self.send(Wire.response(id: request.id, result: result), to: connection)
+      } else {
+        self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
+      }
+    case let method where method.hasPrefix("loginctl."):
+      let outcome = self.loginctl.handle(method: method, params: request.params)
       if let failure = outcome.error {
         self.send(Wire.error(id: request.id, failure), to: connection)
       } else if let result = outcome.result {
