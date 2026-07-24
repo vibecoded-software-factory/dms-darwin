@@ -49,13 +49,17 @@ func resolveGo(pat string) string {
 // the always-available domain socket.
 // evdev.* (Caps Lock) is Swift-owned too: the Go daemon reads a Linux
 // /dev/input device; the Swift channel reads CGEventSource on macOS.
-var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "freedesktop.", "clipboard.", "cups.", "evdev."}
+// network.* (WiFi/Ethernet/VPN) is Swift-owned: the Go daemon's backend is
+// NetworkManager/iwd D-Bus (Linux-only); the Swift channel uses CoreWLAN +
+// SystemConfiguration + scutil.
+var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "freedesktop.", "clipboard.", "cups.", "evdev.", "network."}
 
 // Event `service` names the Swift daemon owns; the same-named event from the
 // (hollow) Go daemon must be dropped so DMS sees only the real one.
 var swiftEventServices = map[string]bool{
 	"brightness": true, "gamma": true, "bluetooth": true, "freedesktop": true,
 	"clipboard": true, "cups": true, "evdev": true,
+	"network": true, "network.credentials": true,
 }
 
 func toSwift(method string) bool {

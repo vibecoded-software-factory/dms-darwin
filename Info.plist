@@ -8,5 +8,12 @@
          description is killed outright (the bento lesson); the daemon's
          bluetooth channel reads paired-device state and drives pairing. -->
     <key>NSBluetoothAlwaysUsageDescription</key><string>dms-darwin serves Bluetooth device state and pairing to DankMaterialShell.</string>
+    <!-- macOS gates WiFi SSID/BSSID behind Location Services (11+): the network
+         channel's CoreWLAN reads return <nil> names without this. Embedded here
+         (not just in a bundle) so TCC finds the purpose string when launchd
+         execs the binary directly. -->
+    <key>NSLocationWhenInUseUsageDescription</key><string>dms-darwin needs your location to read WiFi network names, a macOS requirement for WiFi SSIDs.</string>
+    <key>NSLocationUsageDescription</key><string>dms-darwin needs your location to read WiFi network names, a macOS requirement for WiFi SSIDs.</string>
+    <key>LSUIElement</key><true/>
 </dict>
 </plist>

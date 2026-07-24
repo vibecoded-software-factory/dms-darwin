@@ -29,11 +29,15 @@ final class Server {
   private let clipboard = ClipboardChannel()
   private let cups = CupsChannel()
   private let evdev = EvdevChannel()
+  private let network = NetworkChannel()
   // Registry/git work can take seconds; it never runs on the main loop.
   private let pluginsQueue = DispatchQueue(label: "dev.dms.plugins")
   // CUPS CLI calls (lpinfo -v probes network backends for tens of seconds)
   // must never block the main loop that every other service shares.
   private let cupsQueue = DispatchQueue(label: "dev.dms.cups")
+  // WiFi scans block ~2s and a QR read can wait on a keychain prompt; run
+  // network requests concurrently so one slow call never stalls the WiFi list.
+  private let networkQueue = DispatchQueue(label: "dev.dms.network.rpc", attributes: .concurrent)
   // Last state pushed to subscribers, for the poll-driven change detection
   // (the hardware brightness keys change the panel outside our socket).
   private var lastBrightnessPercent: Int?
@@ -43,6 +47,11 @@ final class Server {
     let fd: Int32
     let source: DispatchSourceRead
     var buffer = Data()
+    // Pending outbound bytes: a non-blocking socket accepts only ~8KB per
+    // write, so a large message (a WiFi state with dozens of networks) is
+    // queued here and flushed as the socket drains.
+    var writeBuffer = Data()
+    var writeSource: DispatchSourceWrite?
     // A connection becomes a subscriber when it sends `subscribe`; from
     // then on it receives event pushes for these services ([] = all).
     var subscribedServices: [String]? = nil
@@ -80,6 +89,10 @@ final class Server {
     caps.append("cups")
     // Caps Lock state via CGEventSource; drives the indicator/OSD.
     caps.append("evdev")
+    // WiFi (CoreWLAN via the foreground helper) + Ethernet (SystemConfiguration)
+    // + VPN (scutil). macOS only unlocks WiFi SSID names for a LaunchServices-
+    // started app, so NetworkChannel open-launches WiFiHelper for that part.
+    caps.append("network")
     return caps
   }
 
@@ -169,6 +182,12 @@ final class Server {
     }
     self.evdev.start()
 
+    // WiFi/Ethernet/VPN changes (roaming, cable, VPN up) push fresh state.
+    self.network.onStateChanged = { [weak self] snapshot in
+      self?.broadcast(service: "network", data: snapshot)
+    }
+    self.network.start()
+
     print("[server] listening on \(self.socketPath) capabilities=\(self.capabilities)")
     return true
   }
@@ -192,6 +211,8 @@ final class Server {
 
   private func dropConnection(_ connection: Connection) {
     self.connections.removeValue(forKey: connection.fd)
+    connection.writeSource?.cancel()
+    connection.writeSource = nil
     connection.source.cancel()
   }
 
@@ -211,17 +232,39 @@ final class Server {
   }
 
   private func send(_ data: Data, to connection: Connection) {
-    let sent = data.withUnsafeBytes { raw in
-      Darwin.write(connection.fd, raw.baseAddress, raw.count)
+    connection.writeBuffer.append(data)
+    self.flush(connection)
+  }
+
+  // Drain writeBuffer into the socket; on EAGAIN (kernel buffer full) arm a
+  // write source and finish later, so a large message is never truncated and a
+  // slow client never blocks the loop.
+  private func flush(_ connection: Connection) {
+    while !connection.writeBuffer.isEmpty {
+      let sent = connection.writeBuffer.withUnsafeBytes { raw in
+        Darwin.write(connection.fd, raw.baseAddress, connection.writeBuffer.count)
+      }
+      if sent > 0 {
+        connection.writeBuffer.removeSubrange(0..<sent)
+      } else if sent < 0 && errno == EAGAIN {
+        self.armWriteSource(connection)
+        return
+      } else {
+        print("[server] DROP fd=\(connection.fd) errno=\(errno)")
+        self.dropConnection(connection)
+        return
+      }
     }
-    // Best-effort: a client too slow to take an event gets dropped, the
-    // same policy as the compositor's event stream.
-    if sent < 0 && errno != EAGAIN {
-      print("[server] DROP fd=\(connection.fd) errno=\(errno)")
-      self.dropConnection(connection)
-    } else if sent >= 0 && sent < data.count {
-      print("[server] SHORT WRITE fd=\(connection.fd) sent=\(sent)/\(data.count)")
-    }
+    connection.writeSource?.cancel()
+    connection.writeSource = nil
+  }
+
+  private func armWriteSource(_ connection: Connection) {
+    if connection.writeSource != nil { return }
+    let source = DispatchSource.makeWriteSource(fileDescriptor: connection.fd, queue: .main)
+    source.setEventHandler { [weak self] in self?.flush(connection) }
+    source.resume()
+    connection.writeSource = source
   }
 
   private func broadcast(service: String, data: Any) {
@@ -281,6 +324,17 @@ final class Server {
         self.send(
           Wire.event(service: "evdev", data: self.evdev.state()),
           to: connection)
+      }
+      if connection.wants("network") {
+        // A WiFi scan blocks ~2s, so compute the initial state off-main and
+        // push it when ready rather than stalling the subscribe handshake.
+        self.networkQueue.async { [weak self] in
+          guard let self else { return }
+          let state = self.network.state()
+          DispatchQueue.main.async {
+            self.send(Wire.event(service: "network", data: state), to: connection)
+          }
+        }
       }
     case "ping":
       self.send(Wire.response(id: request.id, result: "pong"), to: connection)
@@ -376,6 +430,22 @@ final class Server {
         self.send(Wire.response(id: request.id, result: result), to: connection)
       } else {
         self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
+      }
+    case let method where method.hasPrefix("network."):
+      let requestCopy = request
+      self.networkQueue.async { [weak self] in
+        guard let self else { return }
+        let outcome = self.network.handle(method: method, params: requestCopy.params)
+        DispatchQueue.main.async {
+          if let failure = outcome.error {
+            self.send(Wire.error(id: requestCopy.id, failure), to: connection)
+          } else if let result = outcome.result {
+            self.send(Wire.response(id: requestCopy.id, result: result), to: connection)
+          } else {
+            self.send(
+              Wire.error(id: requestCopy.id, "unknown method: \(method)"), to: connection)
+          }
+        }
       }
     default:
       self.send(
