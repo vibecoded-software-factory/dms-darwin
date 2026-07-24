@@ -27,8 +27,12 @@ final class Server {
   private let bluetooth = BluetoothChannel()
   private let plugins = PluginsChannel()
   private let clipboard = ClipboardChannel()
+  private let cups = CupsChannel()
   // Registry/git work can take seconds; it never runs on the main loop.
   private let pluginsQueue = DispatchQueue(label: "dev.dms.plugins")
+  // CUPS CLI calls (lpinfo -v probes network backends for tens of seconds)
+  // must never block the main loop that every other service shares.
+  private let cupsQueue = DispatchQueue(label: "dev.dms.cups")
   // Last state pushed to subscribers, for the poll-driven change detection
   // (the hardware brightness keys change the panel outside our socket).
   private var lastBrightnessPercent: Int?
@@ -71,6 +75,8 @@ final class Server {
     // Clipboard is always serveable on macOS (NSPasteboard), unlike the
     // Go daemon whose clipboard needs Wayland and is absent here.
     caps.append("clipboard")
+    // macOS ships cupsd; served via the CUPS CLI over its domain socket.
+    caps.append("cups")
     return caps
   }
 
@@ -146,6 +152,13 @@ final class Server {
       self.broadcast(service: "clipboard", data: self.clipboard.state())
     }
     self.clipboard.start()
+
+    // Printer/job changes have no push over the CUPS domain socket; the
+    // channel polls and fires this so the shell re-fetches.
+    self.cups.onStateChanged = { [weak self] snapshot in
+      self?.broadcast(service: "cups", data: snapshot)
+    }
+    self.cups.start()
 
     print("[server] listening on \(self.socketPath) capabilities=\(self.capabilities)")
     return true
@@ -250,6 +263,11 @@ final class Server {
           Wire.event(service: "clipboard", data: self.clipboard.state()),
           to: connection)
       }
+      if connection.wants("cups") {
+        self.send(
+          Wire.event(service: "cups", data: self.cups.state()),
+          to: connection)
+      }
     case "ping":
       self.send(Wire.response(id: request.id, result: "pong"), to: connection)
     case let method where method.hasPrefix("brightness."):
@@ -319,6 +337,22 @@ final class Server {
         self.send(Wire.response(id: request.id, result: result), to: connection)
       } else {
         self.send(Wire.error(id: request.id, "unknown method: \(method)"), to: connection)
+      }
+    case let method where method.hasPrefix("cups."):
+      let requestCopy = request
+      self.cupsQueue.async { [weak self] in
+        guard let self else { return }
+        let outcome = self.cups.handle(method: method, params: requestCopy.params)
+        DispatchQueue.main.async {
+          if let failure = outcome.error {
+            self.send(Wire.error(id: requestCopy.id, failure), to: connection)
+          } else if let result = outcome.result {
+            self.send(Wire.response(id: requestCopy.id, result: result), to: connection)
+          } else {
+            self.send(
+              Wire.error(id: requestCopy.id, "unknown method: \(method)"), to: connection)
+          }
+        }
       }
     default:
       self.send(
