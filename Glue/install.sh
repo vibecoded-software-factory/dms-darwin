@@ -318,13 +318,142 @@ trash)
     esac
     ;;
 *)
-    echo "dms (darwin shim): subcommand '$1' is not ported; available: restart, ipc, cl copy, clipboard copy, dl, blur check, trash" >&2
+    # Everything else (matugen, keybinds, config, setup, update, version, ...)
+    # is served by the REAL dms binary, which builds and runs on macOS
+    # (dms-real, installed below from DankMaterialShell/core + darwin stubs).
+    if [ -x "$HOME/.local/bin/dms-real" ]; then
+        exec "$HOME/.local/bin/dms-real" "$@"
+    fi
+    echo "dms (darwin shim): '$1' needs dms-real (not installed); ran install.sh?" >&2
     exit 1
     ;;
 esac
 EOF
 sed -i '' -e "s|__LABEL__|$LABEL|g" -e "s|__APP__|$APP|g" -e "s|__SHELL_DIR__|$SHELL_DIR|g" "$HOME/.local/bin/dms"
 chmod +x "$HOME/.local/bin/dms"
+
+echo ">> Ensuring matugen (Material-You color generation) is on PATH"
+# matugen drives DMS's dynamic theming (via `dms matugen queue`). It must be on
+# the launchd agent PATH (~/.local/bin, /opt/homebrew/bin). Prefer brew; else
+# cargo install + symlink into ~/.local/bin.
+if ! command -v matugen >/dev/null 2>&1; then
+    brew install matugen >/dev/null 2>&1 \
+        || { command -v cargo >/dev/null 2>&1 && cargo install matugen >/dev/null 2>&1; }
+fi
+if ! [ -x /opt/homebrew/bin/matugen ] && [ -x "$HOME/.cargo/bin/matugen" ]; then
+    ln -sf "$HOME/.cargo/bin/matugen" "$HOME/.local/bin/matugen"
+fi
+
+echo ">> Building the real dms CLI (dms-real: matugen/keybinds/config)"
+# The dms CLI subcommands the shim forwards (matugen queue, keybinds, config,
+# setup, update) are Go and BUILD+RUN on macOS - only 5 tiny darwin platform
+# stubs are missing from DankMaterialShell/core. Build the real binary from the
+# local DMS checkout's core + these stubs. matugen theming (BIN-2), keybinds
+# (BIN-3) and config (BIN-12) then work with the real tool.
+DMS_CORE="$DMS_DIR/core"
+command -v go >/dev/null 2>&1 || brew install go >/dev/null 2>&1 || true
+if [ -d "$DMS_CORE" ] && command -v go >/dev/null 2>&1; then
+    DMSBUILD=$(mktemp -d)
+    cp -R "$DMS_CORE/." "$DMSBUILD/"
+    cat > "$DMSBUILD/internal/wayland/shm/fd_darwin.go" <<'GO_EOF'
+package shm
+
+import (
+	"os"
+
+	"golang.org/x/sys/unix"
+)
+
+// macOS has no memfd/SHM_ANON; a deleted temp file gives an anonymous fd. Only
+// needs to link: the Wayland manager that uses it never inits on macOS.
+func CreateAnonFd(name string) (int, error) {
+	f, err := os.CreateTemp("", name+"-*")
+	if err != nil {
+		return -1, err
+	}
+	os.Remove(f.Name())
+	fd, err := unix.Dup(int(f.Fd()))
+	f.Close()
+	if err != nil {
+		return -1, err
+	}
+	return fd, nil
+}
+GO_EOF
+    cat > "$DMSBUILD/internal/matugen/signal_darwin.go" <<'GO_EOF'
+package matugen
+
+import (
+	"os/exec"
+	"strings"
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
+
+func signalByName(name string, sig syscall.Signal) {
+	signame := strings.TrimPrefix(unix.SignalName(sig), "SIG")
+	exec.Command("pkill", "-"+signame, "-x", name).Run()
+}
+GO_EOF
+    cat > "$DMSBUILD/internal/server/trayrecovery/suspend_darwin.go" <<'GO_EOF'
+package trayrecovery
+
+import "time"
+
+func timeSuspended() time.Duration { return 0 }
+GO_EOF
+    cat > "$DMSBUILD/internal/trash/mounts_darwin.go" <<'GO_EOF'
+package trash
+
+import "golang.org/x/sys/unix"
+
+func readMountPoints() []string {
+	n, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)
+	if err != nil || n == 0 {
+		return nil
+	}
+	stats := make([]unix.Statfs_t, n)
+	n, err = unix.Getfsstat(stats, unix.MNT_NOWAIT)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, st := range stats[:n] {
+		mp := unix.ByteSliceToString(st.Mntonname[:])
+		if mp == "" || skipMountPoint(mp, seen) {
+			continue
+		}
+		seen[mp] = true
+		out = append(out, mp)
+	}
+	return out
+}
+GO_EOF
+    cat > "$DMSBUILD/internal/server/brightness/native_darwin.go" <<'GO_EOF'
+package brightness
+
+import "github.com/AvengeMedia/DankMaterialShell/core/internal/log"
+
+// No sysfs/DDC backlight on macOS; brightness is served by the Swift
+// dms-darwin daemon (DisplayServices). Stays hollow so the Go build links.
+func (m *Manager) initNative() {
+	log.Debug("brightness: no native backend on macOS (served by dms-darwin)")
+}
+GO_EOF
+    ( cd "$DMSBUILD" && GOFLAGS=-mod=mod go build -o "$HOME/.local/bin/dms-real" ./cmd/dms ) \
+        && echo "   dms-real built" || echo "!! dms-real build failed" >&2
+    rm -rf "$DMSBUILD"
+else
+    echo "!! dms-real: no go or no DMS core; matugen/keybinds stay off" >&2
+fi
+# The dms CLI resolves the niri config via macOS UserConfigDir
+# (~/Library/Application Support/niri); the ecosystem uses ~/.config/niri.
+# Bridge them so keybinds/config read the real file.
+APPSUP="$HOME/Library/Application Support"
+mkdir -p "$APPSUP"
+[ -e "$APPSUP/niri" ] || ln -s "$HOME/.config/niri" "$APPSUP/niri"
 
 # The shell writes the SYSTEM color scheme by exec'ing gsettings (its
 # PortalService probes `command -v gsettings || command -v dconf` and there
