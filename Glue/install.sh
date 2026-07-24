@@ -444,6 +444,31 @@ func (m *Manager) initNative() {
 GO_EOF
     ( cd "$DMSBUILD" && GOFLAGS=-mod=mod go build -o "$HOME/.local/bin/dms-real" ./cmd/dms ) \
         && echo "   dms-real built" || echo "!! dms-real build failed" >&2
+    # dms-serve: the headless Go daemon (server.New().Listen().Serve()) - the
+    # portable half of the DMS daemon on macOS, fronted by the mux.
+    mkdir -p "$DMSBUILD/cmd/dms-serve"
+    cat > "$DMSBUILD/cmd/dms-serve/main.go" <<'GO_EOF'
+package main
+
+import (
+	"log"
+
+	"github.com/AvengeMedia/DankMaterialShell/core/internal/server"
+)
+
+func main() {
+	s := server.New()
+	if err := s.Listen(); err != nil {
+		log.Fatal(err)
+	}
+	log.Println("dms-serve on", s.SocketPath())
+	if err := s.Serve(false); err != nil {
+		log.Fatal(err)
+	}
+}
+GO_EOF
+    ( cd "$DMSBUILD" && GOFLAGS=-mod=mod go build -o "$HOME/.local/bin/dms-serve" ./cmd/dms-serve ) \
+        && echo "   dms-serve built" || echo "!! dms-serve build failed" >&2
     rm -rf "$DMSBUILD"
 else
     echo "!! dms-real: no go or no DMS core; matugen/keybinds stay off" >&2
@@ -810,6 +835,70 @@ PLIST_EOF
     launchctl bootout "gui/$(id -u)/dev.dcal" 2>/dev/null || true
     launchctl bootstrap "gui/$(id -u)" "$DCAL_PLIST" 2>/dev/null || true
     echo "   dev.dcal agent (re)started - add an account: dcal account add icloud"
+fi
+
+echo ">> Building dms-mux and wiring the daemon coexistence"
+# The Go daemon (dms-serve) serves the portable capabilities; the Swift daemon
+# (dms-darwin) serves the macOS-native ones. DMS talks to ONE socket, so a mux
+# owns $DMS_SOCKET, dials both, merges their capability handshakes, and routes
+# by service. See Glue/dms-mux/.
+MUX_SRC="$(cd "$(dirname "$0")" && pwd)/dms-mux"
+if [ -d "$MUX_SRC" ] && command -v go >/dev/null 2>&1; then
+    ( cd "$MUX_SRC" && GOFLAGS=-mod=mod go build -o "$HOME/.local/bin/dms-mux" . ) \
+        && echo "   dms-mux built" || echo "!! dms-mux build failed" >&2
+fi
+XRD="$HOME/.local/state/dms-run"; mkdir -p "$XRD"
+DMS_REAL_SOCKET="${DMS_SOCKET:-/tmp/dms-darwin.sock}"
+DMS_NATIVE_SOCKET="/tmp/dms-darwin-native.sock"
+if [ -x "$HOME/.local/bin/dms-serve" ] && [ -x "$HOME/.local/bin/dms-mux" ]; then
+    # (a) move the Swift daemon (dev.dms) to the native side socket
+    if [ -f "$HOME/Library/LaunchAgents/dev.dms.plist" ]; then
+        /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:DMS_SOCKET $DMS_NATIVE_SOCKET" \
+            "$HOME/Library/LaunchAgents/dev.dms.plist" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:DMS_SOCKET string $DMS_NATIVE_SOCKET" \
+               "$HOME/Library/LaunchAgents/dev.dms.plist"
+        launchctl bootout "gui/$(id -u)/dev.dms" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.dms.plist" 2>/dev/null || true
+    fi
+    # (b) the Go daemon
+    cat > "$HOME/Library/LaunchAgents/dev.dms-go.plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.dms-go</string>
+  <key>ProgramArguments</key><array><string>$HOME/.local/bin/dms-serve</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>XDG_RUNTIME_DIR</key><string>$XRD</string>
+    <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardOutPath</key><string>/tmp/dms-go.log</string><key>StandardErrorPath</key><string>/tmp/dms-go.log</string>
+  <key>ProcessType</key><string>Background</string>
+</dict></plist>
+PLIST_EOF
+    launchctl bootout "gui/$(id -u)/dev.dms-go" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.dms-go.plist" 2>/dev/null || true
+    sleep 2
+    # (c) the mux on the real $DMS_SOCKET
+    cat > "$HOME/Library/LaunchAgents/dev.dms-mux.plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.dms-mux</string>
+  <key>ProgramArguments</key><array><string>$HOME/.local/bin/dms-mux</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>DMS_SOCKET</key><string>$DMS_REAL_SOCKET</string>
+    <key>DMS_GO_SOCKET</key><string>$XRD/danklinux-*.sock</string>
+    <key>DMS_SWIFT_SOCKET</key><string>$DMS_NATIVE_SOCKET</string>
+  </dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardOutPath</key><string>/tmp/dms-mux.log</string><key>StandardErrorPath</key><string>/tmp/dms-mux.log</string>
+  <key>ProcessType</key><string>Background</string>
+</dict></plist>
+PLIST_EOF
+    launchctl bootout "gui/$(id -u)/dev.dms-mux" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.dms-mux.plist" 2>/dev/null || true
+    echo "   daemon coexistence wired (swift=native, go, mux on $DMS_REAL_SOCKET)"
 fi
 
 echo ">> Installing the launch agent $LABEL"
