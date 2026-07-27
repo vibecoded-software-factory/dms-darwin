@@ -18,6 +18,9 @@ import SystemConfiguration
 // DankMaterialShell's DMSNetworkService.qml expects (types.go verbatim).
 final class NetworkChannel {
   var onStateChanged: (([String: Any]) -> Void)?
+  // Raised when a connect needs a password. The shell opens its prompt from
+  // the `network.credentials` EVENT and nothing else - see requestCredentials.
+  var onCredentialsPrompt: (([String: Any]) -> Void)?
 
   private let queue = DispatchQueue(label: "dev.dms.network")
   // self.wifi + these fields are touched from both the bridge queue (helper
@@ -408,6 +411,7 @@ final class NetworkChannel {
       let token = "net-\(ssid)-\(self.nextId())"
       self.setPending(token, ssid)
       self.setConnecting(ssid)
+      self.requestCredentials(token: token, ssid: ssid)
       return (["token": token, "ssid": ssid, "needsCredentials": true], nil)
     }
 
@@ -438,6 +442,38 @@ final class NetworkChannel {
     defer { self.lock.unlock() }
     self.cmdId += 1
     return self.cmdId
+  }
+
+  // Push the prompt that actually opens the shell's password dialog.
+  //
+  // Returning `needsCredentials` in the RESPONSE is not enough, and was the
+  // whole bug: DMS reads that flow only from the `network.credentials` event
+  // (DMSService.qml -> credentialsRequest -> DMSNetworkService
+  // .handleCredentialsRequest), and nothing in the shell so much as looks at
+  // the response field - so connecting to a secured network sat in
+  // "connecting" forever without ever asking for a password. The response
+  // field is kept because it is upstream's shape, but the event is the part
+  // that works.
+  //
+  // Fields mirror the Go daemon's CredentialPrompt (network/types.go:229)
+  // verbatim, so the shell's handler binds unchanged. WiFi is the only
+  // credential flow this daemon raises, hence the fixed 802-11 setting and the
+  // single `psk` field; a VPN import would add its own.
+  private func requestCredentials(token: String, ssid: String) {
+    self.onCredentialsPrompt?([
+      "token": token,
+      "name": ssid,
+      "ssid": ssid,
+      "connType": "802-11-wireless",
+      "vpnService": "",
+      "setting": "802-11-wireless-security",
+      "fields": ["psk"],
+      "fieldsInfo": [["name": "psk", "label": "Password", "isSecret": true]],
+      "hints": ["psk"],
+      "reason": "Credentials required",
+      "connectionId": ssid,
+      "connectionUuid": "",
+    ])
   }
 
   private func setPending(_ token: String, _ ssid: String?) {

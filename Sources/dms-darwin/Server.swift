@@ -135,6 +135,9 @@ final class Server {
       // Appearance safety net: App Nap can withhold the theme-change
       // notification from an idle agent; the poll catches it anyway.
       self?.freedesktop.pollAppearance()
+      // Power assertions have no notification; this is the only way the
+      // screensaver inhibitor list stays fresh.
+      self?.freedesktop.pollScreensaver()
     }
     timer.resume()
     self.pollTimer = timer
@@ -151,6 +154,12 @@ final class Server {
     self.freedesktop.onStateChanged = { [weak self] in
       guard let self else { return }
       self.broadcast(service: "freedesktop", data: self.freedesktop.state())
+    }
+
+    // Something took or dropped a display-idle assertion (a video player,
+    // caffeinate, bento's own IdleInhibitor).
+    self.freedesktop.onScreensaverChanged = { [weak self] snapshot in
+      self?.broadcast(service: "freedesktop.screensaver", data: snapshot)
     }
 
     // Pairing prompts drive the shell's BluetoothPairingModal; state
@@ -188,6 +197,12 @@ final class Server {
     // WiFi/Ethernet/VPN changes (roaming, cable, VPN up) push fresh state.
     self.network.onStateChanged = { [weak self] snapshot in
       self?.broadcast(service: "network", data: snapshot)
+    }
+    // The password prompt for a secured network. Its own service name, like
+    // upstream: the shell subscribes to `network.credentials` separately from
+    // `network` and drives its dialog off this.
+    self.network.onCredentialsPrompt = { [weak self] prompt in
+      self?.broadcast(service: "network.credentials", data: prompt)
     }
     self.network.start()
 
@@ -317,6 +332,11 @@ final class Server {
       if connection.wants("freedesktop"), self.freedesktop.available {
         self.send(
           Wire.event(service: "freedesktop", data: self.freedesktop.state()),
+          to: connection)
+      }
+      if connection.wants("freedesktop.screensaver"), self.freedesktop.available {
+        self.send(
+          Wire.event(service: "freedesktop.screensaver", data: self.freedesktop.screensaverState()),
           to: connection)
       }
       if connection.wants("clipboard") {
