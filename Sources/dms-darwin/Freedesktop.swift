@@ -1,4 +1,5 @@
 import Foundation
+import IOKit.pwr_mgt
 import OpenDirectory
 
 // The `freedesktop.*` channel: the shell's accounts/portal protocol, shapes
@@ -21,6 +22,28 @@ final class FreedesktopChannel: NSObject {
     // The server hooks this to push fresh state when the system appearance
     // changes behind our back (the OS auto-switch, System Settings).
     var onStateChanged: (() -> Void)?
+    /// Raised when the set of display-idle inhibitors changes.
+    ///
+    /// Its own callback because the shell subscribes to
+    /// `freedesktop.screensaver` as a separate service from `freedesktop`, and
+    /// reads `inhibited` / `inhibitors` off it.
+    var onScreensaverChanged: (([String: Any]) -> Void)?
+    /// Cookies of the inhibitors last reported, for change detection.
+    private var lastInhibitorCookies: Set<Int> = []
+
+    /// Re-read the assertions and push them if the holders changed.
+    ///
+    /// Polled rather than observed: IOKit publishes no notification for the
+    /// assertion table, and the holders change at human speed. Shares the
+    /// server's existing 2s tick, so it costs one extra IOKit call.
+    func pollScreensaver() {
+        let state = self.screensaverState()
+        let cookies = Set(
+            (state["inhibitors"] as? [[String: Any]] ?? []).compactMap { $0["cookie"] as? Int })
+        guard cookies != self.lastInhibitorCookies else { return }
+        self.lastInhibitorCookies = cookies
+        self.onScreensaverChanged?(state)
+    }
 
     var available: Bool { true }
 
@@ -126,11 +149,71 @@ final class FreedesktopChannel: NSObject {
                 "uid": UInt64(getuid()),
             ],
             "settings": ["available": true, "colorScheme": self.colorScheme()],
-            "screensaver": [
-                "available": false, "active": false, "inhibited": false, "inhibitors": [],
-            ],
+            "screensaver": self.screensaverState(),
         ]
     }
+
+    // ---- screensaver ----
+
+    /// Who is currently holding the display awake, in the shell's shape.
+    ///
+    /// Upstream is the freedesktop screensaver interface: apps call Inhibit
+    /// over D-Bus and the daemon lists the holders. The macOS equivalent is a
+    /// power assertion, and `IOPMCopyAssertionsByProcess` is public IOKit -
+    /// which is also what `pmset -g assertions` prints. So the inhibitor list
+    /// is real here, not empty: a video player, `caffeinate`, and bento's own
+    /// IdleInhibitor all show up, because all three take the same assertion.
+    ///
+    /// Only display-idle assertions count. A process may hold
+    /// PreventSystemSleep while the display is free to sleep, and reporting
+    /// that as a screensaver inhibitor would light the shell's indicator for
+    /// every background download.
+    ///
+    /// Fields mirror the Go daemon's ScreensaverInhibitor (freedesktop/
+    /// types.go:38): cookie, appName, reason, peer, startTime. `peer` is the
+    /// pid, which is the closest thing to a D-Bus peer name here.
+    func screensaverState() -> [String: Any] {
+        var inhibitors: [[String: Any]] = []
+        var byProcess: Unmanaged<CFDictionary>?
+        if IOPMCopyAssertionsByProcess(&byProcess) == kIOReturnSuccess,
+            let table = byProcess?.takeRetainedValue() as? [NSNumber: [[String: Any]]]
+        {
+            for (pid, assertions) in table {
+                for assertion in assertions {
+                    guard let type = assertion["AssertionTrueType"] as? String
+                            ?? assertion["AssertType"] as? String,
+                        Self.displayIdleAssertions.contains(type)
+                    else { continue }
+                    inhibitors.append([
+                        "cookie": assertion["AssertionId"] as? Int ?? 0,
+                        "appName": assertion["Process Name"] as? String ?? "pid \(pid.intValue)",
+                        "reason": assertion["AssertName"] as? String ?? type,
+                        "peer": String(pid.intValue),
+                        "startTime": Int(
+                            (assertion["AssertStartWhen"] as? Date ?? Date()).timeIntervalSince1970),
+                    ])
+                }
+            }
+        }
+        return [
+            "available": true,
+            // The screen being locked is loginctl's business, not this one's;
+            // upstream reports `active` for a running screensaver and macOS
+            // exposes no public read for that.
+            "active": false,
+            "inhibited": !inhibitors.isEmpty,
+            "inhibitors": inhibitors,
+        ]
+    }
+
+    /// Assertion types that hold the DISPLAY awake, and so suppress a
+    /// screensaver. `NoDisplaySleepAssertion` is the long-standing name and
+    /// `PreventUserIdleDisplaySleep` its modern spelling; both appear in the
+    /// live table depending on which API the holder used.
+    private static let displayIdleAssertions: Set<String> = [
+        "NoDisplaySleepAssertion",
+        "PreventUserIdleDisplaySleep",
+    ]
 
     // ---- methods ----
 

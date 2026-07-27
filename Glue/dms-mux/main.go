@@ -67,7 +67,8 @@ var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "fre
 // on the path at all.
 var swiftEventServices = map[string]bool{
 	"brightness": true, "gamma": true, "bluetooth": true, "bluetooth.pairing": true,
-	"freedesktop": true, "clipboard": true, "cups": true, "evdev": true,
+	"freedesktop": true, "freedesktop.screensaver": true,
+	"clipboard": true, "cups": true, "evdev": true,
 	"network": true, "network.credentials": true, "loginctl": true,
 }
 
