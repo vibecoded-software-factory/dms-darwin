@@ -9,7 +9,26 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # agent gone. Shared with Glue/install.sh rather than inlined: both scripts had
 # the same bug, and a second copy is how the two drift apart again.
 . "$(cd "$(dirname "$0")" && pwd)/lib-launchd.sh"
-SOCKET="${DMS_SOCKET:-/tmp/dms-darwin.sock}"
+# Which socket this daemon binds. The FRONT socket - the one the shell connects
+# to - belongs to the mux whenever the mux is installed, because there it fronts
+# both this daemon and the Go one; this daemon then serves the NATIVE side
+# socket, which is what Glue/install.sh dials the mux at.
+#
+# Deciding it here rather than hardcoding the front path is what stops the two
+# installers from fighting over the same address. Both used to write
+# /tmp/dms-darwin.sock: Glue/install.sh moved this agent off it with PlistBuddy
+# afterwards, so a later re-run of THIS script silently moved it back. And
+# Server.start() unlinks before it binds, so the daemon did not fail to start -
+# it took the path from under the mux, which stayed alive and unreachable.
+# Every capability only the Go daemon serves (browser, theme.auto, wallpaper,
+# sysupdate, themes) went dark, with both agents reporting healthy.
+MUX_PLIST="$HOME/Library/LaunchAgents/dev.dms-mux.plist"
+if [ -f "$MUX_PLIST" ]; then
+	DEFAULT_SOCKET=/tmp/dms-darwin-native.sock
+else
+	DEFAULT_SOCKET=/tmp/dms-darwin.sock
+fi
+SOCKET="${DMS_SOCKET:-$DEFAULT_SOCKET}"
 BIN_DIR="$HOME/.local/bin"
 PLIST="$HOME/Library/LaunchAgents/dev.dms.plist"
 
