@@ -6,223 +6,98 @@
 #   - ~/Applications/Bento.app         a signed bundle of the bento binary, so
 #                                      the login agent has a stable TCC identity
 #                                      (the same reason nigiri ships as an .app)
-#   - this repo's quickshell/ dir       DankMaterialShell + a thin macOS wrapper
-#                                      (shell-macos.qml) that mirrors the shell's
-#                                      wallpaper onto the real macOS desktop
+#   - ~/.local/share/dms-darwin/shell  the assembled shell root: one symlink per
+#                                      entry of the DankMaterialShell checkout,
+#                                      plus our own entry point and wallpaper
+#                                      bridge (Glue/qml) as real files
 #   - ~/Library/LaunchAgents/dev.bento.plist   runs it at login, kept alive
 #
-# Re-runnable: rebuilds, re-bundles, rewrites the wrapper, and restarts the
-# agent. `uninstall.sh` tears it back down.
+# Re-runnable: rebuilds, re-bundles, reassembles the staging root, and restarts
+# the agent. `uninstall.sh` tears it back down.
 set -e
 
-# This script is VERSIONED IN dms-darwin (Glue/) and run against the DMS
-# checkout - DMS's own tree stays pristine (its core QML must never be
-# modified; the macOS wrapper files below are generated build products).
+# This script is VERSIONED IN dms-darwin (Glue/) and run AGAINST the DMS
+# checkout, which is third-party and strictly READ-ONLY: it is only ever read
+# from - never patched, never written into. Our own QML lives in Glue/qml and
+# reaches bento through the staging root below.
 # Default assumes the standard sibling layout; override with DMS_DIR.
 DMS_DIR="${DMS_DIR:-$(cd "$(dirname "$0")/../../DankMaterialShell" && pwd)}"
 SHELL_DIR="$DMS_DIR/quickshell"
-BENTO_REPO="${BENTO_REPO:-$HOME/Downloads/GitHub/vibecoded-software-factory/bento-box}"
-BUILD_DIR="$BENTO_REPO/build-release"
+# Our own QML, versioned here rather than in DMS - see the staging tree below.
+GLUE_QML="$(cd "$(dirname "$0")" && pwd)/qml"
+# The assembled shell root bento is actually pointed at. NOT inside DMS: that
+# checkout is third-party and read-only.
+STAGE_DIR="${DMS_STAGE_DIR:-$HOME/.local/share/dms-darwin/shell}"
+# Same sibling assumption as DMS_DIR, and resolved the same way: the previous
+# default was an absolute path from the machine this was written on, so a clone
+# anywhere else failed on the first run. Override with BENTO_REPO.
+BENTO_REPO="${BENTO_REPO:-$(cd "$(dirname "$0")/../../bento-box" && pwd)}"
+# The bundle and the agent label are bento-box's to create - these two are here
+# only because the `dms` CLI shim below has to point at them (`dms ipc` runs the
+# bundled binary; `dms restart` kickstarts the label). The build dir, the plist
+# path and the log path are NOT here: they belong to bento-box's installer, and
+# a second copy of them is what let the two scripts drift apart.
 APP="$HOME/Applications/Bento.app"
 LABEL="dev.bento"
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG="/tmp/bento.log"
 NIRI_SOCKET="${NIRI_SOCKET:-/tmp/nigiri-msg.sock}"
 # The darwin system daemon (dms-darwin) serving brightness/night/etc over
 # the DMS daemon protocol; installed by its own repo's Scripts/install.sh.
 DMS_SOCKET="${DMS_SOCKET:-/tmp/dms-darwin.sock}"
 
-echo ">> Building bento (release)"
-cmake -S "$BENTO_REPO" -B "$BUILD_DIR" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="$(brew --prefix qt)" \
-    -DWAYLAND=OFF -DX11=OFF -DI3=OFF -DBLUETOOTH=OFF -DNETWORK=OFF \
-    -DCRASH_HANDLER=OFF -DUSE_JEMALLOC=OFF \
-    -DSERVICE_MPRIS=OFF -DSERVICE_PIPEWIRE=OFF -DSERVICE_UPOWER=OFF \
-    -DSERVICE_STATUS_NOTIFIER=OFF -DSERVICE_NOTIFICATIONS=OFF \
-    -DSERVICE_PAM=OFF -DSERVICE_POLKIT=OFF -DSERVICE_GREETD=OFF >/dev/null
-cmake --build "$BUILD_DIR"
-BIN="$BUILD_DIR/src/quickshell"
+# Shared with Scripts/install.sh - see there for why this is not inlined.
+. "$(cd "$(dirname "$0")/../Scripts" && pwd)/lib-launchd.sh"
 
-echo ">> Bundling $APP"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
-cp "$BIN" "$APP/Contents/MacOS/bento"
-# Ship the MediaRemote adapter framework inside the bundle so the app is
-# self-contained: bento resolves it from Contents/Frameworks at runtime instead
-# of depending on the build tree still being present. Loaded by the entitled
-# system perl (not linked), so its own ad-hoc signature is left as built.
-MRA="$BUILD_DIR/src/mac/mpris/mediaremote-adapter/MediaRemoteAdapter.framework"
-if [ -d "$MRA" ]; then
-    mkdir -p "$APP/Contents/Frameworks"
-    cp -R "$MRA" "$APP/Contents/Frameworks/"
-fi
-cat > "$APP/Contents/Info.plist" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key><string>dev.bento</string>
-    <key>CFBundleName</key><string>Bento</string>
-    <key>CFBundleExecutable</key><string>bento</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleVersion</key><string>1.0</string>
-    <key>LSUIElement</key><true/>
-    <!-- macOS hard-CRASHES a launchd-run app that touches a TCC-protected API
-         with no usage-description string (this is why it "worked" from a
-         terminal but not as an agent: the terminal was the responsible process).
-         The bar reads Bluetooth device state, so it needs this or it aborts. -->
-    <key>NSBluetoothAlwaysUsageDescription</key><string>DankMaterialShell shows Bluetooth device status in the bar.</string>
-    <key>NSAppleEventsUsageDescription</key><string>DankMaterialShell controls desktop features.</string>
-    <!-- The audio visualizer (cava) captures audio input; on macOS any input
-         capture (even a loopback like BlackHole) needs Microphone access. -->
-    <key>NSMicrophoneUsageDescription</key><string>DankMaterialShell visualizes audio in the bar.</string>
-    <key>NSDownloadsFolderUsageDescription</key><string>DankMaterialShell reads its own files, installed under Downloads.</string>
-</dict>
-</plist>
-EOF
-# A stable code-signing identity keeps any TCC grant (e.g. Bluetooth) alive
-# across rebuilds; ad-hoc re-pins to the per-build hash. Create a self-signed
-# "bento codesign" certificate to get the stable path, as nigiri documents.
-if security find-identity -v -p codesigning | grep -q "bento codesign"; then
-    # Let codesign use the private key non-interactively: since Sierra macOS
-    # requires the key's partition list to include codesign, or signing fails
-    # with errSecInternalComponent. Best-effort (an empty keychain password).
-    security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
-        -k "" "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
-    codesign --force --sign "bento codesign" --identifier dev.bento "$APP"
-else
-    echo "   (no 'bento codesign' cert; ad-hoc signature)"
-    codesign --force --sign - --identifier dev.bento "$APP"
-fi
 
-# Drift guard: shell-macos.qml below embeds a copy of shell.qml's body
-# (QML has no include; the wrapper adds the Mac bridge + audio tap around
-# the same loaders). If upstream shell.qml changes, the copy must be
-# reviewed - warn LOUDLY instead of drifting silently.
+# Drift guard: Glue/qml/shell-macos.qml embeds a copy of upstream shell.qml's
+# body (QML has no include; the wrapper adds the Mac bridge + audio tap around
+# the same loaders). If upstream shell.qml changes, that copy must be reviewed -
+# warn LOUDLY instead of drifting silently.
 SHELL_QML_EXPECTED="e33a870ba8a89c1ac27108ffcbd6a9f2b51e6d0b85df1f827ce0a0f81ab45c19"
 SHELL_QML_ACTUAL="$(shasum -a 256 "$SHELL_DIR/shell.qml" | cut -d' ' -f1)"
 if [ "$SHELL_QML_ACTUAL" != "$SHELL_QML_EXPECTED" ]; then
     echo "!! WARNING: upstream shell.qml changed since the macOS wrapper was written." >&2
-    echo "!!          Review Glue/install.sh's shell-macos.qml heredoc against it," >&2
-    echo "!!          then update SHELL_QML_EXPECTED. Continuing with the old wrapper body." >&2
+    echo "!!          Review Glue/qml/shell-macos.qml against it, then update" >&2
+    echo "!!          SHELL_QML_EXPECTED. Continuing with the old wrapper body." >&2
 fi
 
-echo ">> Writing the macOS wrapper into $SHELL_DIR"
-# The entry point: DankMaterialShell's shell, plus the wallpaper bridge. Kept
-# here (not upstream) so a DMS update never clobbers it and vice-versa.
-cat > "$SHELL_DIR/shell-macos.qml" <<'EOF'
-//@ pragma Env QSG_RENDER_LOOP=threaded
-//@ pragma Env QT_QUICK_CONTROLS_STYLE=Material
-//@ pragma UseQApplication
-//@ pragma AppId com.danklinux.dms
-
-// macOS entry point: DankMaterialShell's shell.qml, plus the wallpaper bridge
-// that mirrors the shell's wallpaper onto the real macOS desktop. bento
-// suppresses the shell's own background (wallpaper) layer on macOS, so this
-// keeps the desktop in sync with what the shell was asked to show. Kept as a
-// thin wrapper so upstream shell.qml stays untouched.
-
-import QtQuick
-import Quickshell
-import Quickshell.Io
-import qs.Common
-import qs.Modules
-import qs.Services
-
-ShellRoot {
-    id: entrypoint
-
-    readonly property bool disableHotReload: Quickshell.env("DMS_DISABLE_HOT_RELOAD") === "1" || Quickshell.env("DMS_DISABLE_HOT_RELOAD") === "true"
-
-    Component.onCompleted: {
-        Quickshell.watchFiles = !disableHotReload;
-    }
-
-    // macOS-only: keep the OS desktop wallpaper in sync with the shell.
-    MacWallpaperBridge {}
-
-    // macOS-only: system-audio tap for the visualizer. Runs as OUR child so
-    // it inherits the shell's Screen Recording grant (TCC follows the
-    // responsible process). Streams every output device - the PipeWire
-    // monitor-source analogue - into the fifo cava reads, replacing the
-    // BlackHole + aggregate-device contraption (which also broke the
-    // hardware volume keys by making an aggregate the default output).
-    Process {
-        id: audioTap
-        running: SettingsData.audioVisualizerEnabled
-        command: [Quickshell.env("HOME") + "/.local/bin/dms-darwin", "audio-tap", "/tmp/dms-audio-tap.fifo"]
-        onExited: restartTap.restart()
-    }
-    Timer {
-        id: restartTap
-        interval: 3000
-        onTriggered: if (SettingsData.audioVisualizerEnabled) audioTap.running = true
-    }
-
-    Loader {
-        id: wallpaperLoader
-        asynchronous: false
-
-        sourceComponent: Scope {
-            WallpaperBackground {}
-
-            Loader {
-                active: SettingsData.blurredWallpaperLayer && CompositorService.isNiri
-                asynchronous: false
-                sourceComponent: BlurredWallpaperBackground {}
-            }
-        }
-    }
-
-    Loader {
-        id: shellCoreLoader
-        asynchronous: true
-        source: "ShellCore.qml"
-        onLoaded: dmsShellLoader.setSource("DMSShell.qml", {
-            core: item
-        })
-    }
-
-    Loader {
-        id: dmsShellLoader
-        asynchronous: true
-    }
-}
-EOF
-cat > "$SHELL_DIR/MacWallpaperBridge.qml" <<'EOF'
-import QtQuick
-import Quickshell
-import Quickshell.Mac
-import qs.Common
-
-// Mirror the shell's chosen wallpaper onto the real macOS desktop.
-//
-// On Wayland the shell paints its own wallpaper on a background layer surface;
-// on macOS bento suppresses that layer (the OS owns the desktop) and we drive
-// the OS wallpaper here instead, so changing the wallpaper in the shell changes
-// it for real. This is client-side wiring: bento stays generic (it just exposes
-// Quickshell.Mac.Desktop), and only this file knows it is DankMaterialShell's
-// SessionData that holds the path.
-Scope {
-    function apply() {
-        var path = SessionData.wallpaperPath;
-        // Skip empty and solid-colour values (a "#rrggbb" string) - the OS
-        // wallpaper API only takes an image file.
-        if (path && path.length > 0 && !path.startsWith("#")) {
-            Desktop.setWallpaper(path);
-        }
-    }
-
-    Connections {
-        target: SessionData
-        function onWallpaperPathChanged() { apply(); }
-    }
-
-    // Apply whatever is already set once the session has loaded.
-    Component.onCompleted: apply()
-}
-EOF
+echo ">> Assembling the shell staging tree in $STAGE_DIR"
+# DankMaterialShell is THIRD-PARTY and strictly READ-ONLY: nothing of ours is
+# ever written into its tree - not the entry point, not the wallpaper bridge,
+# not a patch. `git status` in that checkout must stay clean.
+#
+# That is not free, because bento roots `import qs.*` and every relative
+# `source:` at the DIRECTORY OF THE -p FILE (core/rootwrapper.cpp:
+# `auto rootPath = rootFile.dir()`). A wrapper living outside the upstream tree
+# and pointing back at it would resolve its imports next to ITSELF and find
+# nothing.
+#
+# So assemble a staging root that IS a valid shell root: one symlink per
+# top-level entry of the upstream tree, plus our own files as real files
+# beside them. bento's scanner lists a symlink like any other entry
+# (core/scan.cpp walks with QDir::Files, which drops nothing unless
+# NoSymLinks is passed), so `import qs.Common` resolves through the link into
+# DMS while DMS itself is never touched.
+#
+# Rebuilt from scratch every run: a link to a file upstream has since renamed
+# would otherwise linger forever, and a stale QML file is a silent failure.
+rm -rf "$STAGE_DIR"
+mkdir -p "$STAGE_DIR"
+links=0
+for entry in "$SHELL_DIR"/*; do
+    [ -e "$entry" ] || continue
+    name="$(basename "$entry")"
+    # Never link our own names: they are placed as real files below, and an
+    # upstream file that ever took one of these names would win the link.
+    case "$name" in
+    shell-macos.qml | MacWallpaperBridge.qml) continue ;;
+    esac
+    ln -sfn "$entry" "$STAGE_DIR/$name"
+    links=$((links + 1))
+done
+# The real files: versioned in THIS repo (Glue/qml), copied in. Editing them
+# means re-running this script - which is already how every other change lands.
+cp "$GLUE_QML/shell-macos.qml" "$GLUE_QML/MacWallpaperBridge.qml" "$STAGE_DIR/"
+echo "   $links links into DMS + 2 files of ours"
 
 echo ">> Installing the dms CLI shim"
 # The shell shells out to the `dms` CLI (the Go binary on Linux) for a few
@@ -339,7 +214,7 @@ trash)
     ;;
 esac
 EOF
-sed -i '' -e "s|__LABEL__|$LABEL|g" -e "s|__APP__|$APP|g" -e "s|__SHELL_DIR__|$SHELL_DIR|g" "$HOME/.local/bin/dms"
+sed -i '' -e "s|__LABEL__|$LABEL|g" -e "s|__APP__|$APP|g" -e "s|__SHELL_DIR__|$STAGE_DIR|g" "$HOME/.local/bin/dms"
 chmod +x "$HOME/.local/bin/dms"
 
 echo ">> Ensuring matugen (Material-You color generation) is on PATH"
@@ -869,9 +744,7 @@ if [ -x "$HOME/.local/bin/dsearch" ]; then
 </dict>
 </plist>
 PLIST_EOF
-    launchctl bootout "gui/$(id -u)/dev.dsearch" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$DSEARCH_PLIST" 2>/dev/null || true
-    echo "   dev.dsearch agent (re)started"
+    restart_agent dev.dsearch "$DSEARCH_PLIST" || true
 fi
 
 echo ">> Installing dcal (calendar: local, Google, Microsoft, CalDAV, iCloud)"
@@ -885,7 +758,10 @@ command -v go >/dev/null 2>&1 || brew install go >/dev/null 2>&1 || true
 mkdir -p "$HOME/.local/state/dms-run" && chmod 700 "$HOME/.local/state/dms-run"
 DCAL_SRC=$(mktemp -d)
 if git clone --quiet --depth 1 https://github.com/AvengeMedia/dankcalendar "$DCAL_SRC" 2>/dev/null; then
-    ( cd "$DCAL_SRC" && GOFLAGS=-mod=mod go build -o "$HOME/.local/bin/dcal" ./core/cmd/dcal ) \
+    # Built from core/, not the repo root: upstream keeps go.mod in core/, so a
+    # build launched from the root fails with "cannot find main module" and the
+    # install silently kept whatever old dcal happened to be on disk.
+    ( cd "$DCAL_SRC/core" && GOFLAGS=-mod=mod go build -o "$HOME/.local/bin/dcal" ./cmd/dcal ) \
         && echo "   dcal built" || echo "!! dcal build failed" >&2
 else
     echo "!! dcal: clone failed, calendar backend stays off" >&2
@@ -916,9 +792,8 @@ if [ -x "$HOME/.local/bin/dcal" ]; then
 </dict>
 </plist>
 PLIST_EOF
-    launchctl bootout "gui/$(id -u)/dev.dcal" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$DCAL_PLIST" 2>/dev/null || true
-    echo "   dev.dcal agent (re)started - add an account: dcal account add icloud"
+    restart_agent dev.dcal "$DCAL_PLIST" || true
+    echo "   (add a calendar account with: dcal account add icloud)"
 fi
 
 echo ">> Building dms-mux and wiring the daemon coexistence"
@@ -941,8 +816,7 @@ if [ -x "$HOME/.local/bin/dms-serve" ] && [ -x "$HOME/.local/bin/dms-mux" ]; the
             "$HOME/Library/LaunchAgents/dev.dms.plist" 2>/dev/null \
             || /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:DMS_SOCKET string $DMS_NATIVE_SOCKET" \
                "$HOME/Library/LaunchAgents/dev.dms.plist"
-        launchctl bootout "gui/$(id -u)/dev.dms" 2>/dev/null || true
-        launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.dms.plist" 2>/dev/null || true
+        restart_agent dev.dms "$HOME/Library/LaunchAgents/dev.dms.plist" || true
     fi
     # (b) the Go daemon
     cat > "$HOME/Library/LaunchAgents/dev.dms-go.plist" <<PLIST_EOF
@@ -960,8 +834,7 @@ if [ -x "$HOME/.local/bin/dms-serve" ] && [ -x "$HOME/.local/bin/dms-mux" ]; the
   <key>ProcessType</key><string>Background</string>
 </dict></plist>
 PLIST_EOF
-    launchctl bootout "gui/$(id -u)/dev.dms-go" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.dms-go.plist" 2>/dev/null || true
+    restart_agent dev.dms-go "$HOME/Library/LaunchAgents/dev.dms-go.plist" || true
     sleep 2
     # (c) the mux on the real $DMS_SOCKET
     cat > "$HOME/Library/LaunchAgents/dev.dms-mux.plist" <<PLIST_EOF
@@ -980,71 +853,31 @@ PLIST_EOF
   <key>ProcessType</key><string>Background</string>
 </dict></plist>
 PLIST_EOF
-    launchctl bootout "gui/$(id -u)/dev.dms-mux" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.dms-mux.plist" 2>/dev/null || true
+    restart_agent dev.dms-mux "$HOME/Library/LaunchAgents/dev.dms-mux.plist" || true
     echo "   daemon coexistence wired (swift=native, go, mux on $DMS_REAL_SOCKET)"
 fi
 
-echo ">> Installing the launch agent $LABEL"
-mkdir -p "$HOME/Library/LaunchAgents"
-cat > "$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>$LABEL</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$APP/Contents/MacOS/bento</string>
-        <string>-p</string>
-        <string>$SHELL_DIR/shell-macos.qml</string>
-    </array>
-    <!-- The compositor exports NIRI_SOCKET via launchctl setenv, but at login
-         this agent may start before it does; pin the well-known path so the
-         shell finds the compositor regardless of startup order. -->
-    <key>EnvironmentVariables</key>
-    <dict>
-        <!-- dcal (and other XDG tools) create their runtime sockets here; DMS's
-             own socket discovery reads the same dir, so keep them aligned. -->
-        <key>XDG_RUNTIME_DIR</key><string>$HOME/.local/state/dms-run</string>
-        <key>NIRI_SOCKET</key><string>$NIRI_SOCKET</string>
-        <key>NIGIRI_SOCKET</key><string>$NIRI_SOCKET</string>
-        <key>DMS_SOCKET</key><string>$DMS_SOCKET</string>
-        <!-- A launchd agent inherits a bare PATH (/usr/bin:/bin:...) with no
-             Homebrew, so the shell's tool probes (e.g. 'command -v cava', which
-             decides whether the media widget shows the audio visualizer or the
-             music-note fallback) silently fail. Put Homebrew on PATH so those
-             features light up the way they do on a normal login. -->
-        <!-- ~/.local/bin carries dms-darwin and the `dms` CLI shim the shell
-             invokes (e.g. the power menu's "Restart DMS" runs `dms restart`). -->
-        <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    </dict>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key><false/>
-    </dict>
-    <key>StandardOutPath</key><string>$LOG</string>
-    <key>StandardErrorPath</key><string>$LOG</string>
-    <key>ProcessType</key><string>Interactive</string>
-</dict>
-</plist>
-EOF
-
-echo ">> (Re)starting the agent"
-DOMAIN="gui/$(id -u)"
-# bootout is asynchronous: bootstrapping again too soon races the teardown and
-# fails with "Bootstrap failed: 5: Input/output error". Wait for the label to
-# actually leave the domain, then bootstrap (RunAtLoad starts it - no kickstart,
-# which would SIGKILL the just-started instance for nothing).
-launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-    launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break
-    sleep 0.3
-done
-launchctl bootstrap "$DOMAIN" "$PLIST"
+echo ">> Installing bento (delegated to bento-box)"
+# The bento half - build, bundle, sign, plist, agent - belongs to bento-box and
+# is done by ITS installer. This script used to carry a second copy of all of
+# it, and the copy had drifted: it signed ad-hoc when it could not find the
+# certificate (silently dropping every TCC grant), never verified what it had
+# signed, and wrote a plist missing DMS_SCREENSHOT_EDITOR. Running the two in
+# either order overwrote the other's work.
+#
+# What stays here is what is genuinely ours: the staging root assembled above,
+# the shims, the daemons and their coexistence. Everything bento-specific is
+# passed in as environment, which is exactly the interface that script already
+# documents.
+# BENTO_AGENT_PATH is deliberately NOT passed: bento-box already defaults it to
+# the same list, and a second copy here is how this file drifted from that one
+# in the first place.
+BENTO_SHELL_QML="$STAGE_DIR/shell-macos.qml" \
+DMS_SOCKET="$DMS_SOCKET" \
+NIRI_SOCKET="$NIRI_SOCKET" \
+XDG_RUNTIME_DIR="$XRD" \
+    "$BENTO_REPO/Scripts/install.sh"
 
 echo ""
 echo "Done. DankMaterialShell is running and will start at login."
-echo "  logs:      $LOG"
 echo "  uninstall: $(dirname "$0")/uninstall.sh"
