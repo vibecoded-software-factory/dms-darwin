@@ -160,9 +160,13 @@ clipboard)
     exit 1
     ;;
 blur)
-    # bento does not back panels with a blur surface on macOS yet, so report
-    # unsupported. Exit 0 so BlurService.qml does not log a probe failure.
-    [ "$2" = "check" ] && { echo unsupported; exit 0; }
+    # bento backs panel surfaces with a real blur: BackgroundEffect.blurRegion
+    # drives an NSVisualEffectView in `behindWindow` blending mode, masked to
+    # the region (src/mac/wayland/wayland.cpp + src/mac/bridge.mm). That is the
+    # macOS stand-in for ext-background-effect-v1, which is what BlurService is
+    # probing for, so report it supported and let the shell enable its blurred
+    # surfaces.
+    [ "$2" = "check" ] && { echo supported; exit 0; }
     echo "dms (darwin shim): blur subcommand '$2' is not ported" >&2
     exit 1
     ;;
