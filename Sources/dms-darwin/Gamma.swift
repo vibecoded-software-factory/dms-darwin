@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 // The `wayland.gamma.*` channel: the shell's night-mode protocol, shapes and
@@ -28,6 +29,8 @@ final class GammaChannel {
     private var manualSunset: (hour: Int, minute: Int)?
     private var manualSunriseRaw: String?
     private var manualSunsetRaw: String?
+    // The gamma exponent, upstream's default of 1.0 (identity). Applied to the
+    // display hardware by applyGammaRamp(); see there for the mapping.
     private var gammaValue = 1.0
 
     // IP-geolocated coordinates, kept apart from explicit ones; enabling IP
@@ -271,7 +274,16 @@ final class GammaChannel {
             self.evaluate(broadcast: false)
             return (["success": true, "message": "IP location preference set"], nil)
         case "wayland.gamma.setGamma":
-            if let gamma = Self.number(params["gamma"]) { self.gammaValue = gamma }
+            guard let gamma = Self.number(params["gamma"]) else {
+                return (nil, "missing param: gamma")
+            }
+            // Upstream's own bounds (wayland/types.go:143), so a value this
+            // daemon rejects is a value the Go daemon rejects too.
+            guard gamma > 0, gamma <= 10 else {
+                return (nil, "invalid gamma: must be in (0, 10]")
+            }
+            self.gammaValue = gamma
+            if let failure = self.applyGammaRamp() { return (nil, failure) }
             return (["success": true, "message": "gamma set"], nil)
         default:
             return (nil, nil)
@@ -281,6 +293,48 @@ final class GammaChannel {
     private static func number(_ value: Any?) -> Double? {
         if let d = value as? Double { return d }
         if let i = value as? Int { return Double(i) }
+        return nil
+    }
+
+    // Push the gamma exponent into every active display's hardware ramp.
+    //
+    // This is the direct macOS counterpart of wlr-gamma-control, which is what
+    // upstream writes its ramp through - CGSetDisplayTransferByFormula is
+    // public CoreGraphics, has been since 10.0, and needs no permission and no
+    // private symbol.
+    //
+    // EXPONENT CONVENTION: upstream builds its ramp as pow(value, 1.0/gamma)
+    // (wayland/gamma.go:144-146), while CoreGraphics samples
+    // `Min + (Max - Min) * pow(index, Gamma)` - so the value handed to
+    // CoreGraphics is the RECIPROCAL. Getting this backwards is invisible at
+    // gamma 1.0 and inverts the curve everywhere else.
+    //
+    // Only the exponent goes here. Upstream's ramp folds the colour
+    // temperature into the same curve as a white-point multiplier; on macOS
+    // the temperature is Night Shift's, so the two are applied by different
+    // mechanisms and compose in the display pipeline rather than in one table.
+    //
+    // - Returns: nil on success, or a message naming the display that refused.
+    private func applyGammaRamp() -> String? {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else {
+            return "no active displays"
+        }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &displays, &count) == .success else {
+            return "could not enumerate displays"
+        }
+        let exponent = CGGammaValue(1.0 / self.gammaValue)
+        for display in displays.prefix(Int(count)) {
+            let error = CGSetDisplayTransferByFormula(
+                display,
+                0, 1, exponent,
+                0, 1, exponent,
+                0, 1, exponent)
+            guard error == .success else {
+                return "display \(display) refused the gamma ramp (CGError \(error.rawValue))"
+            }
+        }
         return nil
     }
 }
