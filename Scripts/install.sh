@@ -5,6 +5,10 @@
 set -eu
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# `bootout` is asynchronous, and bootstrapping before it finishes leaves the
+# agent gone. Shared with Glue/install.sh rather than inlined: both scripts had
+# the same bug, and a second copy is how the two drift apart again.
+. "$(cd "$(dirname "$0")" && pwd)/lib-launchd.sh"
 SOCKET="${DMS_SOCKET:-/tmp/dms-darwin.sock}"
 BIN_DIR="$HOME/.local/bin"
 PLIST="$HOME/Library/LaunchAgents/dev.dms.plist"
@@ -77,7 +81,8 @@ cat > "$PLIST" <<PLIST_EOF
 </plist>
 PLIST_EOF
 
-launchctl bootout "gui/$(id -u)/dev.dms" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# No `|| true`: this daemon IS the install. `set -eu` stops here if it does not
+# come up, rather than printing a success line over a dead agent.
+restart_agent dev.dms "$PLIST"
 
 echo "dms-darwin installed and started (socket: $SOCKET, log: /tmp/dms-darwin.log)"
