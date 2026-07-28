@@ -111,6 +111,29 @@ final class LoginctlChannel {
       self.lockedHint = params["locked"] as? Bool ?? false
       self.onStateChanged?(self.state())
       return (["success": true, "message": "locked hint set"], nil)
+    case "loginctl.lockerReady":
+      // The shell's lock surface reports that it has actually PAINTED
+      // (LockScreenContent.sendLockerReadyOnce, driven off afterAnimating /
+      // afterRendering). On logind that is what releases the delay inhibitor
+      // the daemon holds so the machine cannot suspend with the locker still
+      // blank.
+      //
+      // There is nothing to release here, and that is deliberate rather than
+      // unfinished. The only power assertion this channel owns is the one
+      // loginctl.setSleepInhibitorEnabled takes, and DMS drives that one
+      // explicitly from its own setting - dropping it on this signal would
+      // fight the shell for it. macOS also gives an unprivileged process no
+      // delay-style inhibitor: IOPMAssertion holds off IDLE sleep, never a
+      // sleep already under way, so the race logind's inhibitor exists to
+      // close cannot be closed from here at all.
+      //
+      // Answering it is still the point: DMS sends this on every lock and
+      // logged "lockerReady failed: unknown method" each time. Nothing is
+      // published either - `locked` tracks the macOS screen-lock notifications,
+      // which do not fire for the shell's own surface, and there is no matching
+      // "locker gone" request to clear it again. Setting it here would strand
+      // the session as locked forever.
+      return (["success": true, "message": "locker ready acknowledged"], nil)
     case "loginctl.setLockBeforeSuspend":
       // logind stores this and locks the session itself on suspend; there is no
       // logind here, so the flag arms our own willSleep handler. Persisting it
