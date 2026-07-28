@@ -19,13 +19,22 @@ final class LoginctlChannel {
   private var preparingForSleep = false
   private var locked = false
   private var lockedHint = false
+  private var lockBeforeSuspend = false
   private var sleepAssertion: IOPMAssertionID = IOPMAssertionID(0)
 
   func start() {
     let ws = NSWorkspace.shared.notificationCenter
     ws.addObserver(
       forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
-    ) { [weak self] _ in self?.setSleeping(true) }
+    ) { [weak self] _ in
+      // Locking belongs to THIS notification only. logind's lock-before-suspend
+      // hangs off PrepareForSleep, whose macOS twin is system sleep - not the
+      // display sleep below, which is the screensaver's business and has its own
+      // setting. DMS never locks on sleep itself (SessionService only reacts to
+      // the state we publish), so if we skip it nothing else will.
+      self?.lockForSuspendIfEnabled()
+      self?.setSleeping(true)
+    }
     ws.addObserver(
       forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
     ) { [weak self] _ in self?.setSleeping(false) }
@@ -57,6 +66,14 @@ final class LoginctlChannel {
     guard self.locked != value else { return }
     self.locked = value
     self.onStateChanged?(self.state())
+  }
+
+  // The whole point of loginctl.setLockBeforeSuspend: engage the lock screen on
+  // the way down. Skipped when already locked, so waking a locked machine does
+  // not re-arm the login window underneath itself.
+  private func lockForSuspendIfEnabled() {
+    guard self.lockBeforeSuspend, !self.locked else { return }
+    _ = NativeLock.lock()
   }
 
   func state() -> [String: Any] {
@@ -94,6 +111,16 @@ final class LoginctlChannel {
       self.lockedHint = params["locked"] as? Bool ?? false
       self.onStateChanged?(self.state())
       return (["success": true, "message": "locked hint set"], nil)
+    case "loginctl.setLockBeforeSuspend":
+      // logind stores this and locks the session itself on suspend; there is no
+      // logind here, so the flag arms our own willSleep handler. Persisting it
+      // is DMS's job (SettingsData.lockBeforeSuspend) - SessionService re-sends
+      // it on connect, so holding it in memory is correct, not a shortcut.
+      self.lockBeforeSuspend = params["enabled"] as? Bool ?? false
+      return (
+        ["success": true, "message": self.lockBeforeSuspend
+          ? "will lock before suspend" : "will not lock before suspend"], nil
+      )
     case "loginctl.setSleepInhibitorEnabled":
       let enabled = params["enabled"] as? Bool ?? false
       self.setSleepInhibitor(enabled)
