@@ -56,8 +56,18 @@ var swiftPrefixes = []string{"brightness.", "wayland.gamma.", "bluetooth.", "fre
 
 // Event `service` names the Swift daemon owns; the same-named event from the
 // (hollow) Go daemon must be dropped so DMS sees only the real one.
+//
+// EVERY service the Swift daemon can push must appear here, not just the ones
+// with a Go counterpart worth suppressing: relay() rejects any event whose
+// service is absent, because `swiftEventServices[svc] != isSwift` reads a
+// missing key as false and a Swift event carries isSwift true. `bluetooth.pairing`
+// was missing, so the prompt that drives DMS's BluetoothPairingModal
+// (Server.swift's onPairingPrompt) never reached the shell and confirming a
+// pairing was impossible - a bug masked until now only because the mux was not
+// on the path at all.
 var swiftEventServices = map[string]bool{
-	"brightness": true, "gamma": true, "bluetooth": true, "freedesktop": true,
+	"brightness": true, "gamma": true, "bluetooth": true, "bluetooth.pairing": true,
+	"freedesktop": true, "freedesktop.screensaver": true,
 	"clipboard": true, "cups": true, "evdev": true,
 	"network": true, "network.credentials": true, "loginctl": true,
 }
